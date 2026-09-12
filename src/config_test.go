@@ -131,7 +131,11 @@ func TestValidateEmptyLogFile(t *testing.T) {
 }
 
 func TestLoadSampleConfig(t *testing.T) {
-	cfg, err := LoadConfig("config.json")
+	path := "config.json"
+	if _, err := os.Stat(path); err != nil {
+		path = filepath.Join("..", "config.json")
+	}
+	cfg, err := LoadConfig(path)
 	if err != nil {
 		t.Fatalf("sample config.json: %v", err)
 	}
