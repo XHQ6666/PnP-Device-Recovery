@@ -7,28 +7,57 @@ import (
 	"time"
 )
 
+// Per-device recovery states.
+const (
+	StateIdle       = "Idle"
+	StateRecovering = "Recovering"
+	StateExhausted  = "Exhausted"
+)
+
+// deviceOps lets tests stub SetupAPI/CfgMgr32.
+type deviceOps struct {
+	Enumerate          func() ([]DeviceInfo, error)
+	GetByInstanceID    func(string) (*DeviceInfo, error)
+	FindByFriendlyName func(string) (*DeviceInfo, error)
+	Disable            func(*DeviceInfo) error
+	Enable             func(*DeviceInfo) error
+}
+
+func realDeviceOps() deviceOps {
+	return deviceOps{
+		Enumerate:          EnumerateDevices,
+		GetByInstanceID:    GetDeviceByInstanceID,
+		FindByFriendlyName: FindDeviceByFriendlyName,
+		Disable:            DisableDevice,
+		Enable:             EnableDevice,
+	}
+}
+
 // RecoveryManager coordinates per-device recovery sessions.
 // Same device never runs concurrent recoveries (events coalesce).
-// Exhausting max_retries ends that session only — listener stays alive.
+// Exhausted devices do not auto-retry on normal PnP events — only check clears.
 type RecoveryManager struct {
 	cfg      *Config
 	matchers []*Matcher
 	logger   *Logger
 	delay    time.Duration
+	ops      deviceOps
 
 	mu       sync.Mutex
-	sessions map[string]*deviceSession // key: InstanceID
+	sessions map[string]*deviceSession // key: NormalizeInstanceID
 	wg       sync.WaitGroup
 	stopping bool
 }
 
 type deviceSession struct {
 	mu         sync.Mutex
+	state      string
 	running    bool
 	attempts   int
 	cfgIdx     int
 	maxRetries int
-	name       string // matched friendly name / pattern
+	name       string
+	instanceID string
 }
 
 // NewRecoveryManager creates a manager for the given config and matchers.
@@ -38,8 +67,20 @@ func NewRecoveryManager(cfg *Config, matchers []*Matcher, logger *Logger) *Recov
 		matchers: matchers,
 		logger:   logger,
 		delay:    time.Duration(cfg.RetryDelay) * time.Second,
+		ops:      realDeviceOps(),
 		sessions: make(map[string]*deviceSession),
 	}
+}
+
+func (rm *RecoveryManager) setOps(ops deviceOps) {
+	rm.ops = ops
+}
+
+func sessionKey(instanceID, friendlyName string, cfgIdx int) string {
+	if instanceID != "" {
+		return NormalizeInstanceID(instanceID)
+	}
+	return fmt.Sprintf("cfg:%d:%s", cfgIdx, friendlyName)
 }
 
 // StopNewWork prevents starting new recovery sessions (shutdown).
@@ -65,8 +106,68 @@ func (rm *RecoveryManager) FindMatcher(friendlyName string) (*Matcher, *DeviceCo
 	return nil, nil
 }
 
-// HandleDeviceProblem is called from PnP event workers (never from the PnP callback itself).
-// It starts a recovery session if the device matches and is unhealthy, coalescing duplicates.
+// ClearExhausted resets Exhausted → Idle for every device (check command).
+func (rm *RecoveryManager) ClearExhausted() {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for key, sess := range rm.sessions {
+		sess.mu.Lock()
+		if sess.state == StateExhausted {
+			sess.state = StateIdle
+			sess.attempts = 0
+			rm.logger.Infof("cleared Exhausted for %q (%s); next recovery starts at attempt=1", sess.name, key)
+		}
+		sess.mu.Unlock()
+	}
+}
+
+// Scan enumerates devices and starts recovery for unhealthy configured matches.
+// reason=check clears Exhausted first. reason=pnp_event / startup skip Exhausted.
+func (rm *RecoveryManager) Scan(ctx context.Context, reason ScanReason) {
+	rm.logger.Infof("scan start: reason=%s trigger_instance=%q trigger_action=%q",
+		reason.Reason, reason.TriggerInstance, reason.TriggerAction)
+
+	if reason.Reason == "check" {
+		rm.ClearExhausted()
+	}
+
+	devices, err := rm.ops.Enumerate()
+	if err != nil {
+		rm.logger.Errorf("enumerate failed (reason=%s): %v", reason.Reason, err)
+		return
+	}
+
+	for _, m := range rm.matchers {
+		found := false
+		for i := range devices {
+			dev := &devices[i]
+			if !m.Match(dev.FriendlyName) {
+				continue
+			}
+			found = true
+			if dev.DevInst != 0 {
+				rm.logger.Infof("scan match: reason=%s pattern=%q name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d healthy=%v",
+					reason.Reason, m.Pattern(), dev.FriendlyName, dev.InstanceID, dev.DevInst, dev.Status, dev.ProblemCode, dev.IsHealthy())
+			} else {
+				rm.logger.Infof("scan match: reason=%s pattern=%q name=%q instance=%q event_devinst_unset status=0x%X problem=%d healthy=%v",
+					reason.Reason, m.Pattern(), dev.FriendlyName, dev.InstanceID, dev.Status, dev.ProblemCode, dev.IsHealthy())
+			}
+			if !dev.IsHealthy() {
+				rm.HandleDeviceProblem(ctx, dev)
+			}
+		}
+		if !found {
+			if reason.Reason == "startup" {
+				rm.logger.Warnf("configured device not found at startup: pattern=%q (will keep listening)", m.Pattern())
+			} else {
+				rm.logger.Warnf("configured device not found: pattern=%q reason=%s", m.Pattern(), reason.Reason)
+			}
+		}
+	}
+}
+
+// HandleDeviceProblem starts a recovery session if the device matches and is unhealthy.
+// Exhausted devices are skipped (use check). Same device is serial; different devices parallel.
 func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *DeviceInfo) {
 	if info == nil {
 		return
@@ -76,15 +177,12 @@ func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *Device
 		return
 	}
 	if info.IsHealthy() {
-		rm.logger.Infof("device healthy, skip recovery: name=%q instance=%q DEVINST=%d status=0x%X problem=%d",
+		rm.logger.Infof("device healthy, skip recovery: name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d",
 			info.FriendlyName, info.InstanceID, info.DevInst, info.Status, info.ProblemCode)
 		return
 	}
 
-	key := info.InstanceID
-	if key == "" {
-		key = fmt.Sprintf("cfg:%d:%s", m.Index(), info.FriendlyName)
-	}
+	key := sessionKey(info.InstanceID, info.FriendlyName, m.Index())
 
 	rm.mu.Lock()
 	if rm.stopping {
@@ -95,21 +193,29 @@ func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *Device
 	sess, ok := rm.sessions[key]
 	if !ok {
 		sess = &deviceSession{
+			state:      StateIdle,
 			cfgIdx:     m.Index(),
 			maxRetries: dcfg.MaxRetries,
 			name:       info.FriendlyName,
+			instanceID: info.InstanceID,
 		}
 		rm.sessions[key] = sess
 	}
 	rm.mu.Unlock()
 
 	sess.mu.Lock()
-	if sess.running {
+	if sess.state == StateExhausted {
+		sess.mu.Unlock()
+		rm.logger.Infof("device Exhausted, skip automatic recovery for %q (%s); use check to clear", info.FriendlyName, key)
+		return
+	}
+	if sess.running || sess.state == StateRecovering {
 		sess.mu.Unlock()
 		rm.logger.Infof("recovery already in progress for %q (%s), coalesce event", info.FriendlyName, key)
 		return
 	}
 	sess.running = true
+	sess.state = StateRecovering
 	sess.mu.Unlock()
 
 	rm.wg.Add(1)
@@ -118,6 +224,9 @@ func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *Device
 		defer func() {
 			sess.mu.Lock()
 			sess.running = false
+			if sess.state == StateRecovering {
+				sess.state = StateIdle
+			}
 			sess.mu.Unlock()
 		}()
 		rm.runSession(ctx, sess, key, info, dcfg, m)
@@ -125,7 +234,7 @@ func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *Device
 }
 
 func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, key string, initial *DeviceInfo, dcfg *DeviceConfig, m *Matcher) {
-	rm.logger.Infof("recovery session start: name=%q pattern=%q instance=%q DEVINST=%d status=0x%X problem=%d max_retries=%d",
+	rm.logger.Infof("recovery session start: name=%q pattern=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d max_retries=%d",
 		initial.FriendlyName, m.Pattern(), initial.InstanceID, initial.DevInst, initial.Status, initial.ProblemCode, dcfg.MaxRetries)
 
 	for {
@@ -143,20 +252,25 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 		sess.mu.Unlock()
 
 		if attempt > maxR {
-			rm.logger.Errorf("recovery exhausted max_retries=%d for %q (%s); ending session (listener continues)",
+			rm.logger.Errorf("recovery exhausted max_retries=%d for %q (%s); marking Exhausted (check to clear; no auto-retry on PnP)",
 				maxR, initial.FriendlyName, key)
 			sess.mu.Lock()
-			sess.attempts = 0 // next session starts at attempt 1
+			sess.state = StateExhausted
+			sess.attempts = 0 // reset for display; next check session starts at 1
 			sess.mu.Unlock()
 			return
 		}
 
 		rm.logger.Infof("recovery attempt %d/%d for %q (%s)", attempt, maxR, initial.FriendlyName, key)
 
-		// Re-fetch current device state by instance ID when possible.
 		info := initial
 		if initial.InstanceID != "" {
-			if cur, err := GetDeviceByInstanceID(initial.InstanceID); err == nil && cur != nil {
+			if cur, err := rm.ops.GetByInstanceID(initial.InstanceID); err == nil && cur != nil {
+				if cur.DevInst != 0 {
+					rm.logger.Infof("resolved_DEVINST=%d instance=%q (after LocateDevNode)", cur.DevInst, cur.InstanceID)
+				} else {
+					rm.logger.Infof("event_devinst_unset after GetDeviceByInstanceID instance=%q", cur.InstanceID)
+				}
 				info = cur
 			}
 		}
@@ -166,12 +280,13 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 				info.FriendlyName, info.InstanceID)
 			sess.mu.Lock()
 			sess.attempts = 0
+			sess.state = StateIdle
 			sess.mu.Unlock()
 			return
 		}
 
-		rm.logger.Infof("disable device: name=%q instance=%q DEVINST=%d", info.FriendlyName, info.InstanceID, info.DevInst)
-		if err := DisableDevice(info); err != nil {
+		rm.logger.Infof("disable device: name=%q instance=%q resolved_DEVINST=%d", info.FriendlyName, info.InstanceID, info.DevInst)
+		if err := rm.ops.Disable(info); err != nil {
 			rm.logger.Errorf("disable failed for %q (%s): %v", info.FriendlyName, key, err)
 		} else {
 			rm.logger.Infof("disable OK for %q (%s)", info.FriendlyName, key)
@@ -182,8 +297,8 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 			return
 		}
 
-		rm.logger.Infof("enable device: name=%q instance=%q DEVINST=%d", info.FriendlyName, info.InstanceID, info.DevInst)
-		if err := EnableDevice(info); err != nil {
+		rm.logger.Infof("enable device: name=%q instance=%q resolved_DEVINST=%d", info.FriendlyName, info.InstanceID, info.DevInst)
+		if err := rm.ops.Enable(info); err != nil {
 			rm.logger.Errorf("enable failed for %q (%s): %v", info.FriendlyName, key, err)
 		} else {
 			rm.logger.Infof("enable OK for %q (%s)", info.FriendlyName, key)
@@ -194,28 +309,30 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 			return
 		}
 
-		// Recheck status
 		post := info
 		if info.InstanceID != "" {
-			if cur, err := GetDeviceByInstanceID(info.InstanceID); err == nil && cur != nil {
+			if cur, err := rm.ops.GetByInstanceID(info.InstanceID); err == nil && cur != nil {
+				if cur.DevInst != 0 {
+					rm.logger.Infof("resolved_DEVINST=%d instance=%q (post-recovery recheck)", cur.DevInst, cur.InstanceID)
+				}
 				post = cur
 			} else if err != nil {
 				rm.logger.Warnf("recheck GetDeviceByInstanceID failed for %s: %v", info.InstanceID, err)
 			}
 		} else {
-			// Fall back to friendly-name scan
-			if cur, err := FindDeviceByFriendlyName(info.FriendlyName); err == nil && cur != nil {
+			if cur, err := rm.ops.FindByFriendlyName(info.FriendlyName); err == nil && cur != nil {
 				post = cur
 			}
 		}
 
-		rm.logger.Infof("post-recovery status: name=%q instance=%q DEVINST=%d status=0x%X problem=%d healthy=%v",
+		rm.logger.Infof("post-recovery status: name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d healthy=%v",
 			post.FriendlyName, post.InstanceID, post.DevInst, post.Status, post.ProblemCode, post.IsHealthy())
 
 		if post.IsHealthy() {
 			rm.logger.Infof("recovery SUCCESS for %q (%s) on attempt %d; reset counter", post.FriendlyName, key, attempt)
 			sess.mu.Lock()
 			sess.attempts = 0
+			sess.state = StateIdle
 			sess.mu.Unlock()
 			return
 		}
@@ -244,17 +361,46 @@ func sleepOrDone(ctx context.Context, d time.Duration) bool {
 	}
 }
 
-// ScanAndRecoverMissing checks configured devices at startup.
-// Missing devices are logged; listening continues.
-func (rm *RecoveryManager) ScanAndRecoverMissing(ctx context.Context) {
-	devices, err := EnumerateDevices()
-	if err != nil {
-		rm.logger.Errorf("initial enumerate failed: %v (will keep listening)", err)
-		return
+func (rm *RecoveryManager) sessionView(key string) (state string, attempt int) {
+	rm.mu.Lock()
+	sess := rm.sessions[key]
+	rm.mu.Unlock()
+	if sess == nil {
+		return StateIdle, 0
 	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.state, sess.attempts
+}
 
-	matched := make(map[int]bool)
+func (rm *RecoveryManager) sessionViewByCfg(cfgIdx int) (state, instance string, attempt int) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	for _, sess := range rm.sessions {
+		sess.mu.Lock()
+		if sess.cfgIdx == cfgIdx {
+			st, att, inst := sess.state, sess.attempts, sess.instanceID
+			sess.mu.Unlock()
+			return st, inst, att
+		}
+		sess.mu.Unlock()
+	}
+	return StateIdle, "", 0
+}
+
+// DeviceStatuses builds per-configured-device status rows.
+func (rm *RecoveryManager) DeviceStatuses() []DeviceStatus {
+	devices, err := rm.ops.Enumerate()
+	if err != nil {
+		return rm.statusesFromConfig(nil)
+	}
+	return rm.statusesFromConfig(devices)
+}
+
+func (rm *RecoveryManager) statusesFromConfig(devices []DeviceInfo) []DeviceStatus {
+	var out []DeviceStatus
 	for _, m := range rm.matchers {
+		dcfg := rm.cfg.Devices[m.Index()]
 		found := false
 		for i := range devices {
 			dev := &devices[i]
@@ -262,16 +408,30 @@ func (rm *RecoveryManager) ScanAndRecoverMissing(ctx context.Context) {
 				continue
 			}
 			found = true
-			matched[m.Index()] = true
-			rm.logger.Infof("startup match: pattern=%q name=%q instance=%q DEVINST=%d status=0x%X problem=%d healthy=%v",
-				m.Pattern(), dev.FriendlyName, dev.InstanceID, dev.DevInst, dev.Status, dev.ProblemCode, dev.IsHealthy())
-			if !dev.IsHealthy() {
-				rm.HandleDeviceProblem(ctx, dev)
-			}
+			key := sessionKey(dev.InstanceID, dev.FriendlyName, m.Index())
+			state, attempt := rm.sessionView(key)
+			out = append(out, DeviceStatus{
+				Instance:     dev.InstanceID,
+				FriendlyName: dev.FriendlyName,
+				Healthy:      dev.IsHealthy(),
+				Problem:      dev.ProblemCode,
+				State:        state,
+				Attempt:      attempt,
+				MaxRetries:   dcfg.MaxRetries,
+			})
 		}
 		if !found {
-			rm.logger.Warnf("configured device not found at startup: pattern=%q (will keep listening)", m.Pattern())
+			state, inst, attempt := rm.sessionViewByCfg(m.Index())
+			out = append(out, DeviceStatus{
+				Instance:     inst,
+				FriendlyName: m.Pattern(),
+				Healthy:      false,
+				Problem:      0,
+				State:        state,
+				Attempt:      attempt,
+				MaxRetries:   dcfg.MaxRetries,
+			})
 		}
 	}
-	_ = matched
+	return out
 }

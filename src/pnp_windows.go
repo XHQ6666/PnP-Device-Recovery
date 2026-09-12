@@ -17,16 +17,16 @@ var (
 	modUser32   = windows.NewLazySystemDLL("user32.dll")
 	modKernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
-	procRegisterClassExW         = modUser32.NewProc("RegisterClassExW")
-	procCreateWindowExW          = modUser32.NewProc("CreateWindowExW")
-	procDestroyWindow            = modUser32.NewProc("DestroyWindow")
-	procDefWindowProcW           = modUser32.NewProc("DefWindowProcW")
-	procGetMessageW              = modUser32.NewProc("GetMessageW")
-	procTranslateMessage         = modUser32.NewProc("TranslateMessage")
-	procDispatchMessageW         = modUser32.NewProc("DispatchMessageW")
-	procPostQuitMessage          = modUser32.NewProc("PostQuitMessage")
-	procPostMessageW             = modUser32.NewProc("PostMessageW")
-	procRegisterDeviceNotificationW = modUser32.NewProc("RegisterDeviceNotificationW")
+	procRegisterClassExW             = modUser32.NewProc("RegisterClassExW")
+	procCreateWindowExW              = modUser32.NewProc("CreateWindowExW")
+	procDestroyWindow                = modUser32.NewProc("DestroyWindow")
+	procDefWindowProcW               = modUser32.NewProc("DefWindowProcW")
+	procGetMessageW                  = modUser32.NewProc("GetMessageW")
+	procTranslateMessage             = modUser32.NewProc("TranslateMessage")
+	procDispatchMessageW             = modUser32.NewProc("DispatchMessageW")
+	procPostQuitMessage              = modUser32.NewProc("PostQuitMessage")
+	procPostMessageW                 = modUser32.NewProc("PostMessageW")
+	procRegisterDeviceNotificationW  = modUser32.NewProc("RegisterDeviceNotificationW")
 	procUnregisterDeviceNotification = modUser32.NewProc("UnregisterDeviceNotification")
 
 	procGetModuleHandleW = modKernel32.NewProc("GetModuleHandleW")
@@ -36,22 +36,22 @@ var (
 )
 
 const (
-	WM_DEVICECHANGE  = 0x0219
-	WM_DESTROY       = 0x0002
-	WM_CLOSE         = 0x0010
-	WM_QUIT          = 0x0012
-	WM_USER_STOP     = 0x0400 + 77
+	WM_DEVICECHANGE = 0x0219
+	WM_DESTROY      = 0x0002
+	WM_CLOSE        = 0x0010
+	WM_QUIT         = 0x0012
+	WM_USER_STOP    = 0x0400 + 77
 
-	DBT_DEVNODES_CHANGED           = 0x0007
-	DBT_DEVICEARRIVAL              = 0x8000
-	DBT_DEVICEREMOVECOMPLETE       = 0x8004
-	DBT_DEVTYP_DEVICEINTERFACE     = 0x00000005
-	DEVICE_NOTIFY_WINDOW_HANDLE    = 0x00000000
+	DBT_DEVNODES_CHANGED                = 0x0007
+	DBT_DEVICEARRIVAL                   = 0x8000
+	DBT_DEVICEREMOVECOMPLETE            = 0x8004
+	DBT_DEVTYP_DEVICEINTERFACE          = 0x00000005
+	DEVICE_NOTIFY_WINDOW_HANDLE         = 0x00000000
 	DEVICE_NOTIFY_ALL_INTERFACE_CLASSES = 0x00000004
 
-	CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE = 0
-	CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE    = 1
-	CM_NOTIFY_FILTER_TYPE_DEVICEINSTANCE  = 2
+	CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE     = 0
+	CM_NOTIFY_FILTER_TYPE_DEVICEHANDLE        = 1
+	CM_NOTIFY_FILTER_TYPE_DEVICEINSTANCE      = 2
 	CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL   = 0
 	CM_NOTIFY_ACTION_DEVICEINTERFACEREMOVAL   = 1
 	CM_NOTIFY_ACTION_DEVICEQUERYREMOVE        = 2
@@ -112,7 +112,7 @@ type cmNotifyFilter struct {
 }
 
 const CM_NOTIFY_FILTER_FLAG_ALL_INTERFACE_CLASSES = 0x00000001
-const CM_NOTIFY_FILTER_FLAG_ALL_DEVICE_INSTANCES  = 0x00000002
+const CM_NOTIFY_FILTER_FLAG_ALL_DEVICE_INSTANCES = 0x00000002
 
 // windowsPnPListener uses CM_Register_Notification when available,
 // otherwise RegisterDeviceNotification + hidden message window (WM_DEVICECHANGE).
@@ -268,7 +268,7 @@ func (l *windowsPnPListener) cmNotifyCallback(hNotify uintptr, context uintptr, 
 		const header = 8
 		instanceID = windows.UTF16PtrToString((*uint16)(unsafe.Pointer(eventData + header)))
 	}
-	l.logger.Infof("PnP CM event: action=%d kind=%s instance=%q", action, kind, instanceID)
+	l.logger.Infof("PnP CM event: action=%d kind=%s instance=%q event_devinst_unset", action, kind, instanceID)
 	l.enqueue(PnPEvent{Kind: kind, InstanceID: instanceID})
 	return CR_SUCCESS
 }
@@ -358,7 +358,7 @@ func (l *windowsPnPListener) wndProc(hwnd windows.Handle, msg uint32, wParam, lP
 		case DBT_DEVNODES_CHANGED:
 			kind = "nodes_changed"
 		}
-		l.logger.Infof("PnP WM_DEVICECHANGE: wParam=0x%X kind=%s", wParam, kind)
+		l.logger.Infof("PnP WM_DEVICECHANGE: wParam=0x%X kind=%s event_devinst_unset", wParam, kind)
 		l.enqueue(PnPEvent{Kind: kind})
 		return 1
 	case WM_USER_STOP:
@@ -370,6 +370,12 @@ func (l *windowsPnPListener) wndProc(hwnd windows.Handle, msg uint32, wParam, lP
 	}
 	r, _, _ := procDefWindowProcW.Call(uintptr(hwnd), uintptr(msg), wParam, lParam)
 	return r
+}
+
+func (l *windowsPnPListener) Registered() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return (l.useCM && l.notify != 0) || l.hwnd != 0
 }
 
 func (l *windowsPnPListener) Stop() error {

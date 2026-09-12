@@ -1,66 +1,133 @@
-# PnP Device Recovery Utility
+# PnP Device Recovery
 
-Windows 即插即用（PnP）设备自动恢复工具。通过 **事件驱动** 监听设备状态变化；当受监控设备出现问题（`DN_HAS_PROBLEM` 且/或 `ProblemCode != 0`）时，自动执行 **禁用 → 等待 → 启用 → 再检查** 的恢复流程。
+Windows 即插即用（PnP）设备自动恢复工具。以 **事件驱动 + 尾沿合并（trailing-edge debounce）** 监听设备变化；当配置中的设备不健康（`DN_HAS_PROBLEM` 和/或 `ProblemCode != 0`）时，执行 **禁用 → 等待 → 启用 → 再检查**。
 
 > **安全声明 / Disclaimer**  
-> 本工具会禁用并重新启用硬件设备节点，可能导致短暂断网、黑屏或系统不稳定。请仅在了解风险的环境中使用。作者不对数据丢失或硬件损坏负责。请以管理员身份运行。故障排查时可使用系统自带的 `pnputil`（仅供人工诊断，**本程序从不调用** pnputil / PowerShell / WMIC）。
+> 本工具会禁用并重新启用硬件设备节点，可能导致短暂断网、黑屏或系统不稳定。请仅在了解风险的环境中以管理员身份使用。作者不对数据丢失或硬件损坏负责。故障排查时可使用系统自带的 `pnputil`（仅供人工诊断，**本程序从不调用** pnputil / PowerShell / WMIC）。
 
 ---
 
-## 目录结构
+## 为什么启动时绝不立即 Recovery（dGPU / MUX 黑屏）
 
-- 根目录：`README.md`、`config.json`（示例配置）
-- `src/`：全部 Go 源码（`go.mod`、`*.go`、测试）
+笔记本电脑在登录与桌面就绪之前，混合显卡（dGPU）和 MUX 切换尚未稳定。若在此时对 RTX 等独显做 Disable/Enable，显示器可能停在黑屏、驱动未完成初始化。
 
-## 工作原理
+因此守护进程 **禁止** 在创建监听器后立刻扫描恢复。必须等到交互会话稳定，再做一次 `reason=startup` 的初始扫描。
 
 ```
-Windows PnP
-     │
-     ▼
-PnP Event
-     │
-     ▼
-Device Enumeration
-     │
-     ▼
-FriendlyName Match
-     │
-     ▼
-Status / ProblemCode
-     │
- ┌───┴────┐
-正常     异常
- │         │
-结束     Recovery
-           │
-       Disable
-           │
-        Enable
-           │
-      Re-check
+启动
+  │
+  ├─ 解析 CLI（无参数 = 守护进程）
+  ├─ 单实例互斥量
+  ├─ 如需则 UAC 提权（仅守护进程 / 单次 check）
+  │
+  ▼
+phase = STARTING
+  │
+  ├─ 注册 PnP 通知（CM_Register_Notification / WM_DEVICECHANGE）
+  │     此阶段到达的 PnP 事件：只记 pending，不 Recovery
+  │
+  ▼
+phase = WAIT_FOR_SYSTEM_READY
+  │
+  ├─ WTSGetActiveConsoleSessionId + WTSQuerySessionInformation
+  │     等待 WTSActive 交互会话
+  ├─ explorer.exe 作为软信号（非唯一条件）
+  ├─ 会话就绪后再加一段硬编码安全缓冲（约 12 秒）
+  ├─ 最长等待约 8 分钟后带警告继续，避免永久挂起
+  │
+  │  此阶段 PnP 事件：只打日志 “startup PnP event pending”，不 Recovery
+  │
+  ▼
+INITIAL_SCAN  reason=startup
+  │     此时才允许第一次 Recovery
+  │
+  ▼
+phase = NORMAL_RUNNING
+        事件驱动 + 尾沿合并；DISPLAY 事件只触发对配置目标的扫描
 ```
 
-监控为 **事件驱动**（优先 `CM_Register_Notification`，回退 `RegisterDeviceNotification` + 隐藏窗口 `WM_DEVICECHANGE`），**不以固定轮询作为主监控手段**。Disable/Enable 从不在 PnP 回调线程内执行，而是入队由 Recovery worker 处理。
+就绪检测的超时、缓冲、防抖间隔均为 **内部常量**，**不会** 写入 `config.json`。
 
 ---
 
-## 功能特性
+## 事件驱动与尾沿合并
 
-- **事件驱动 PnP**：优先 `CM_Register_Notification`；不可用时回退到 `RegisterDeviceNotification` + 隐藏消息窗口（`WM_DEVICECHANGE`）。**不以轮询作为主监控手段**。
-- **PnP 回调内绝不 Disable/Enable**：事件入队，由 worker 处理。
-- **按设备会话恢复**：独立锁与尝试计数；成功清零；耗尽 `max_retries` 仅结束该会话，**不** `os.Exit`，**不**停止监听。
-- **同设备事件合并（coalesce）**：同一 Instance ID 不会并发恢复；多设备可并发。
-- **FriendlyName 精确匹配**；`regex:` 前缀使用 Go RE2。
-- **设备状态**：仅通过 SetupAPI / CfgMgr32（`golang.org/x/sys/windows` + LazyDLL）。健康条件：无 `DN_HAS_PROBLEM` 且 `ProblemCode == 0`。
-- **UAC**：未提升时 `ShellExecuteEx` + `runas`；用户拒绝则记日志并干净退出。
-- **日志**：UTF-8；超过 **10×1024×1024** 字节后截断覆盖（按字节，非按行）。
-- **优雅关闭**：SIGINT/SIGTERM → 停止新恢复 → 注销 PnP → 等待 worker → 关闭日志。
-- **交叉编译**：`GOOS=windows` 真实实现；Linux 下 stub + `cd src && go test ./...` 覆盖配置/匹配/日志/恢复状态机。
+监控 **不以固定轮询为主**：
+
+1. 优先 `CM_Register_Notification`
+2. 回退 `RegisterDeviceNotification` + 隐藏窗口 `WM_DEVICECHANGE`
+3. **PnP 回调内绝不 Disable/Enable**，只入队
+
+进入 `NORMAL_RUNNING` 后：
+
+- 每个 PnP 事件记录 `trigger_instance` / `trigger_action`，并 **重置** 内部防抖定时器（约 500ms）
+- 定时器触发后，对配置设备做 **一次** 扫描（`reason=pnp_event`，带 `trigger_*` 字段）
+- **DISPLAY 事件同样进入合并队列** → 扫描配置目标；**不会** 把 DISPLAY 实例直接映射成 RTX 恢复
+- 某设备已在 Recovering：只合并，不开启第二会话
+
+启动阶段（`STARTING` / `WAIT_FOR_SYSTEM_READY`）的 PnP 事件不启动恢复，只设 pending；就绪后的那一次初始扫描覆盖它们。
+
+---
+
+## Exhausted 与 `check`
+
+每个设备（键 = **大小写不敏感** 的 InstanceID）有三种状态：
+
+| 状态 | 含义 |
+|------|------|
+| Idle | 空闲 |
+| Recovering | 正在 Disable → Enable → 再检查 |
+| Exhausted | 已用尽 `max_retries` |
+
+- 耗尽后标记 **Exhausted**，尝试计数清零（便于 status 显示），**普通 PnP 事件不再自动开新会话**
+- 只有 CLI / IPC 的 **`check`** 会清除 Exhausted 并重新扫描；若仍不健康，新会话从 **attempt=1** 开始
+- 不同设备可并行；同一设备串行
+
+这改变了旧版「新 PnP 会话自动从 attempt 1 再试」的语义，避免反复折腾已放弃的设备。
+
+---
+
+## CLI、单实例、IPC
+
+```text
+PnP-Device-Recovery.exe              守护进程（单实例）
+PnP-Device-Recovery.exe check        清除 Exhausted 并重扫
+PnP-Device-Recovery.exe status       打印守护进程状态
+PnP-Device-Recovery.exe help         用法（-h / --help）
+```
+
+| 命令 | 行为 |
+|------|------|
+| 无参数 | 守护进程：互斥量 → UAC → 监听 → 等系统就绪 → 初始扫描 → 事件循环 |
+| `check` | 经命名管道通知守护进程；**若守护进程未运行**则单次检查后退出（不留下监听器） |
+| `status` | IPC 状态转储；无守护进程时打印 `not running` 并以退出码 0 结束 |
+| `help` / `-h` / `--help` | 用法，退出码 0（不需要互斥量或守护进程） |
+| 未知参数 | 打印用法，退出码非 0 |
+
+- 单实例互斥量：`Global\PnPDeviceRecovery_SingleInstance`
+- 本地命名管道：`\\.\pipe\PnPDeviceRecovery`（`PIPE_REJECT_REMOTE_CLIENTS`）
+- IPC：一行 JSON，`{"cmd":"check"}` 或 `{"cmd":"status"}`，有基本校验
+- 配置固定为可执行文件旁的 `config.json`（第一参数不再当作配置路径）
+
+### status 输出
+
+- `phase`：`STARTING` / `WAIT_FOR_SYSTEM_READY` / `NORMAL_RUNNING`
+- `listener_registered`
+- 每个配置设备：`instance`、`healthy`、`problem`、`state`（Idle / Recovering / Exhausted）、`attempt`、`max_retries`
+
+---
+
+## 多设备
+
+- `friendly_name` 精确匹配；`regex:` 前缀使用 Go RE2
+- 每个设备独立会话、独立 Exhausted
+- InstanceID 一律 `ToUpper` / `EqualFold` 规范化，避免 `PCI\VEN_…` 与 `pci\ven_…` 被当成两台设备
 
 ---
 
 ## 配置（config.json）
+
+**不要** 增加 `startup_delay`、`debounce`、`poll_interval` 等字段。就绪等待、防抖、安全缓冲都是内部常量。
 
 ```json
 {
@@ -81,113 +148,90 @@ Status / ProblemCode
 
 | 字段 | 含义 |
 |------|------|
-| `devices[].friendly_name` | 精确匹配设备“友好名称”；或以 `regex:` 开头使用 RE2 |
+| `devices[].friendly_name` | 精确匹配或 `regex:` + RE2 |
 | `devices[].max_retries` | 单次恢复会话最大尝试次数（必须 > 0） |
 | `retry_delay` | 禁用/启用后的等待秒数（必须 >= 0） |
 | `log_file` | 日志路径（不可为空） |
 
-### 校验错误（启动时失败，运行中不 panic）
-
-- 配置文件缺失 / JSON 非法  
-- `devices` 为空  
-- `friendly_name` 为空  
-- `regex:` 后为空或非法正则  
-- `max_retries <= 0`  
-- `retry_delay < 0`  
-- `log_file` 为空  
-
-### 匹配规则
-
-1. **精确匹配**：`friendly_name` 与设备 FriendlyName **完全相等**（区分大小写）。  
-2. **正则**：`friendly_name` 以 `regex:` 为前缀时，对剩余部分编译 Go `regexp`（RE2），对 FriendlyName 做 `MatchString`。  
-
-启动时若配置的设备不存在：记录警告并继续监听。
+启动/扫描时设备不存在：记警告并继续监听。
 
 ---
 
-## 恢复语义
+## 恢复算法（未改）
 
 ```
-检测到不健康 → 开启/复用会话（同设备 coalesce）
+检测到不健康（且非 Exhausted）→ 开启/复用会话（同设备 coalesce）
   attempt++
-  if attempt > max_retries → 结束会话（计数归零便于下次会话从 1 开始）；监听继续
+  if attempt > max_retries → 标记 Exhausted（计数归零供显示）；监听继续
   Disable → sleep(retry_delay) → Enable → sleep(retry_delay) → 复查
-  成功 → 计数清零，结束会话
+  成功 → Idle，计数清零
 ```
 
-- 关闭时：`context` 取消，停止新会话，等待进行中的 worker。  
-- 日志记录：时间、名称、Instance ID、DEVINST、Status、ProblemCode、尝试次数、禁用/启用结果、恢复后状态、最终结果、PnP 事件。
+Disable/Enable 失败日志形如：`api=CM_Disable_DevNode result=CR_xxx (0x..)`（如有则附加 win32）。
+
+CM 回调经常没有 DEVINST：日志写 `event_devinst_unset`，**不会把 0 当成真实句柄**；`CM_Locate_DevNode` 成功后写 `resolved_DEVINST=...`。
 
 ---
 
 ## 日志
 
-- 编码：UTF-8  
-- 轮转：文件大小超过 **10 MiB（10×1024×1024）** 时 **截断覆盖** 旧内容（不是按行数）。  
-- 默认文件名：`PnP-Device-Recovery.log`（运行时创建；仓库中可有空占位文件）。
-
----
-
-## UAC
-
-程序检查当前进程是否已提升。若否，通过 `ShellExecuteEx` 以 `runas` 动词重新启动自身。若用户在 UAC 对话框中拒绝，写入错误日志并干净退出（退出码非 0）。
+- UTF-8
+- **写入前** 判断：若 `当前大小 + 本行长度 > 10 MiB（10×1024×1024）`，先截断再写
+- 默认文件名：`PnP-Device-Recovery.log`
 
 ---
 
 ## 编译与运行
 
-### Windows 目标（在 Linux 上交叉编译）
+源码在 `src/`。在 Linux 上交叉编译：
 
 ```bash
-cd /workspace/PnP-Device-Recovery
 cd src
+go test ./...
+go test -race ./...
 GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../PnP-Device-Recovery.exe .
 ```
-
-验证：
 
 ```bash
 file PnP-Device-Recovery.exe
 sha256sum PnP-Device-Recovery.exe
 ```
 
-### Linux 测试（stub + 纯逻辑）
+将 `PnP-Device-Recovery.exe` 与 `config.json` 放在同一目录，以管理员身份运行。
 
-```bash
-cd src && go test ./...
-```
+Linux 下 `*_other.go` 为 stub，便于 `go test` 覆盖配置、匹配、日志、CLI、防抖、Exhausted 状态机。WTS / 命名管道 / 真实 Disable-Enable 只能在 Windows 上验证。
 
-### 在 Windows 上运行
+---
 
-1. 将 `PnP-Device-Recovery.exe` 与 `config.json` 放在同一目录（或传入配置路径参数）。  
-2. 双击或在终端运行；若未管理员，会弹出 UAC。  
-3. 查看 `PnP-Device-Recovery.log`。
+## 限制
 
-```text
-PnP-Device-Recovery.exe
-PnP-Device-Recovery.exe path\to\config.json
-```
+- 仅 Windows 上有真实 PnP / SetupAPI / CfgMgr32 / UAC / 命名管道
+- 不能修复损坏的驱动或硬件；Disable/Enable 只是软复位设备节点
+- 独显恢复仍可能导致短暂黑屏——这正是启动阶段要等会话就绪的原因
+- Exhausted 后必须人工 `check`（或重启守护进程）才会再试
+- 混合显卡 / MUX / 外接显示器拓扑因机器而异，DISPLAY 事件只用来触发扫描，不会对错误的实例做恢复
+- 需要管理员权限才能 Disable/Enable
 
 ---
 
 ## 故障排查（人工）
 
-本程序 **不** 调用下列工具；仅供你在设备管理器之外人工诊断：
+本程序 **不** 调用下列工具：
 
 ```bat
 pnputil /enum-devices /problem
-pnputil /restart-device "USB\VID_...."
+pnputil /restart-device "PCI\VEN_...."
 ```
-
-常见问题：
 
 | 现象 | 可能原因 |
 |------|----------|
-| 启动即退出 | 配置校验失败；查看 stderr |
+| 启动即退出 | 配置校验失败；或单实例互斥量已被占用 |
 | UAC 后仍退出 | 用户拒绝提升 |
+| `status` 显示 not running | 守护进程未启动 |
+| Exhausted 后不再恢复 | 预期行为；运行 `check` |
+| 启动后很久才第一次扫描 | 正在等 WTSActive + 安全缓冲 |
 | 找不到设备 | FriendlyName 与设备管理器不一致；改用 `regex:` |
-| 恢复无效 | 驱动/硬件故障；检查 ProblemCode |
-| 日志突然变短 | 已超过 10MB 并截断轮转 |
+| 日志突然变短 | 已超过 10MiB，写入前截断 |
 
 ---
 
@@ -199,7 +243,7 @@ pnputil /restart-device "USB\VID_...."
 
 | 文件 | 标签 | 说明 |
 |------|------|------|
-| `*_windows.go` | `windows` | SetupAPI / CfgMgr32 / PnP / UAC |
+| `*_windows.go` | `windows` | SetupAPI / CfgMgr32 / PnP / UAC / WTS / 命名管道 / 互斥量 |
 | `*_other.go` | `!windows` | stub，便于 Linux `go test` |
 
 ## 许可证与免责

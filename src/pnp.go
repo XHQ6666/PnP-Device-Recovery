@@ -13,4 +13,5 @@ type PnPEvent struct {
 type PnPListener interface {
 	Start(ctx context.Context) error
 	Stop() error
+	Registered() bool
 }

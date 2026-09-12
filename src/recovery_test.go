@@ -178,3 +178,222 @@ func TestConcurrentDifferentDevices(t *testing.T) {
 		t.Fatalf("expected 2 launches, got %d", started)
 	}
 }
+
+func stubUnhealthy(name, id string) *DeviceInfo {
+	return &DeviceInfo{
+		FriendlyName: name,
+		InstanceID:   id,
+		DevInst:      7,
+		Status:       DN_HAS_PROBLEM,
+		ProblemCode:  43,
+	}
+}
+
+func waitState(t *testing.T, rm *RecoveryManager, id, want string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	key := NormalizeInstanceID(id)
+	for time.Now().Before(deadline) {
+		st, _ := rm.sessionView(key)
+		if st == want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	st, att := rm.sessionView(key)
+	t.Fatalf("state=%s attempt=%d want %s", st, att, want)
+}
+
+func TestExhaustedThenCheckClears(t *testing.T) {
+	lg := testLogger(t)
+	cfg := &Config{
+		Devices:    []DeviceConfig{{FriendlyName: "TestDev", MaxRetries: 2}},
+		RetryDelay: 0,
+		LogFile:    "x.log",
+	}
+	ms, _ := BuildMatchers(cfg.Devices)
+	rm := NewRecoveryManager(cfg, ms, lg)
+
+	dev := stubUnhealthy("TestDev", "PCI\\VEN_10DE\\1")
+	var disables int32
+	rm.setOps(deviceOps{
+		Enumerate: func() ([]DeviceInfo, error) { return []DeviceInfo{*dev}, nil },
+		GetByInstanceID: func(id string) (*DeviceInfo, error) {
+			d := *dev
+			d.InstanceID = id
+			return &d, nil
+		},
+		FindByFriendlyName: func(string) (*DeviceInfo, error) { return dev, nil },
+		Disable: func(*DeviceInfo) error {
+			atomic.AddInt32(&disables, 1)
+			return nil
+		},
+		Enable: func(*DeviceInfo) error { return nil },
+	})
+
+	ctx := context.Background()
+	rm.Scan(ctx, ScanReason{Reason: "startup"})
+	rm.Wait()
+	waitState(t, rm, dev.InstanceID, StateExhausted, 2*time.Second)
+	if n := atomic.LoadInt32(&disables); n != 2 {
+		t.Fatalf("expected 2 disable attempts, got %d", n)
+	}
+
+	// Normal PnP scan must NOT start a new session.
+	rm.Scan(ctx, ScanReason{Reason: "pnp_event", TriggerInstance: "DISPLAY\\X", TriggerAction: "change"})
+	rm.Wait()
+	if n := atomic.LoadInt32(&disables); n != 2 {
+		t.Fatalf("PnP must not retry Exhausted device, disables=%d", n)
+	}
+	st, att := rm.sessionView(NormalizeInstanceID(dev.InstanceID))
+	if st != StateExhausted || att != 0 {
+		t.Fatalf("display after exhaust: state=%s attempt=%d", st, att)
+	}
+
+	// check clears Exhausted and starts attempt 1
+	rm.Scan(ctx, ScanReason{Reason: "check"})
+	rm.Wait()
+	waitState(t, rm, dev.InstanceID, StateExhausted, 2*time.Second)
+	if n := atomic.LoadInt32(&disables); n != 4 {
+		t.Fatalf("check should run a new session (2 more attempts), disables=%d", n)
+	}
+}
+
+func TestInstanceIDFoldSameSession(t *testing.T) {
+	lg := testLogger(t)
+	cfg := &Config{
+		Devices:    []DeviceConfig{{FriendlyName: "TestDev", MaxRetries: 5}},
+		RetryDelay: 0,
+		LogFile:    "x.log",
+	}
+	ms, _ := BuildMatchers(cfg.Devices)
+	rm := NewRecoveryManager(cfg, ms, lg)
+
+	block := make(chan struct{})
+	var disables int32
+	rm.setOps(deviceOps{
+		Enumerate: func() ([]DeviceInfo, error) { return nil, nil },
+		GetByInstanceID: func(id string) (*DeviceInfo, error) {
+			return stubUnhealthy("TestDev", id), nil
+		},
+		FindByFriendlyName: func(string) (*DeviceInfo, error) {
+			return stubUnhealthy("TestDev", "PCI\\VEN_10DE\\1"), nil
+		},
+		Disable: func(*DeviceInfo) error {
+			atomic.AddInt32(&disables, 1)
+			<-block
+			return nil
+		},
+		Enable: func(*DeviceInfo) error { return nil },
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	a := stubUnhealthy("TestDev", "PCI\\VEN_10DE\\1")
+	b := stubUnhealthy("TestDev", "pci\\ven_10de\\1")
+	rm.HandleDeviceProblem(ctx, a)
+	time.Sleep(20 * time.Millisecond)
+	rm.HandleDeviceProblem(ctx, b)
+	close(block)
+	cancel()
+	rm.Wait()
+	if n := atomic.LoadInt32(&disables); n != 1 {
+		t.Fatalf("case-folded IDs must share one session, disables=%d", n)
+	}
+}
+
+func TestStateMachineIdleRecoveringExhausted(t *testing.T) {
+	lg := testLogger(t)
+	cfg := &Config{
+		Devices:    []DeviceConfig{{FriendlyName: "TestDev", MaxRetries: 1}},
+		RetryDelay: 0,
+		LogFile:    "x.log",
+	}
+	ms, _ := BuildMatchers(cfg.Devices)
+	rm := NewRecoveryManager(cfg, ms, lg)
+
+	dev := stubUnhealthy("TestDev", "USB\\VID_0001\\1")
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	rm.setOps(deviceOps{
+		Enumerate: func() ([]DeviceInfo, error) { return []DeviceInfo{*dev}, nil },
+		GetByInstanceID: func(id string) (*DeviceInfo, error) {
+			d := *dev
+			return &d, nil
+		},
+		FindByFriendlyName: func(string) (*DeviceInfo, error) { return dev, nil },
+		Disable: func(*DeviceInfo) error {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+			<-release
+			return nil
+		},
+		Enable: func(*DeviceInfo) error { return nil },
+	})
+
+	ctx := context.Background()
+	if st, _ := rm.sessionView(NormalizeInstanceID(dev.InstanceID)); st != StateIdle {
+		t.Fatalf("pre-start %s", st)
+	}
+	rm.HandleDeviceProblem(ctx, dev)
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("did not enter Recovering")
+	}
+	st, _ := rm.sessionView(NormalizeInstanceID(dev.InstanceID))
+	if st != StateRecovering {
+		t.Fatalf("want Recovering, got %s", st)
+	}
+	close(release)
+	rm.Wait()
+	waitState(t, rm, dev.InstanceID, StateExhausted, 2*time.Second)
+
+	rm.ClearExhausted()
+	st, att := rm.sessionView(NormalizeInstanceID(dev.InstanceID))
+	if st != StateIdle || att != 0 {
+		t.Fatalf("after check-clear: state=%s attempt=%d", st, att)
+	}
+}
+
+func TestSuccessResetsToIdle(t *testing.T) {
+	lg := testLogger(t)
+	cfg := &Config{
+		Devices:    []DeviceConfig{{FriendlyName: "TestDev", MaxRetries: 3}},
+		RetryDelay: 0,
+		LogFile:    "x.log",
+	}
+	ms, _ := BuildMatchers(cfg.Devices)
+	rm := NewRecoveryManager(cfg, ms, lg)
+
+	var step int32
+	rm.setOps(deviceOps{
+		Enumerate: func() ([]DeviceInfo, error) {
+			return []DeviceInfo{*stubUnhealthy("TestDev", "ID1")}, nil
+		},
+		GetByInstanceID: func(id string) (*DeviceInfo, error) {
+			if atomic.LoadInt32(&step) >= 1 {
+				return &DeviceInfo{FriendlyName: "TestDev", InstanceID: id, DevInst: 3}, nil
+			}
+			return stubUnhealthy("TestDev", id), nil
+		},
+		FindByFriendlyName: func(string) (*DeviceInfo, error) {
+			return stubUnhealthy("TestDev", "ID1"), nil
+		},
+		Disable: func(*DeviceInfo) error {
+			atomic.StoreInt32(&step, 1)
+			return nil
+		},
+		Enable: func(*DeviceInfo) error { return nil },
+	})
+
+	ctx := context.Background()
+	rm.HandleDeviceProblem(ctx, stubUnhealthy("TestDev", "ID1"))
+	rm.Wait()
+	st, att := rm.sessionView(NormalizeInstanceID("ID1"))
+	if st != StateIdle || att != 0 {
+		t.Fatalf("success should return Idle/0, got %s/%d", st, att)
+	}
+}

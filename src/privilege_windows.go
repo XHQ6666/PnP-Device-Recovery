@@ -12,18 +12,18 @@ import (
 )
 
 var (
-	modShell32           = windows.NewLazySystemDLL("shell32.dll")
-	modAdvapi32          = windows.NewLazySystemDLL("advapi32.dll")
-	procShellExecuteExW  = modShell32.NewProc("ShellExecuteExW")
-	procOpenProcessToken = modAdvapi32.NewProc("OpenProcessToken")
+	modShell32              = windows.NewLazySystemDLL("shell32.dll")
+	modAdvapi32             = windows.NewLazySystemDLL("advapi32.dll")
+	procShellExecuteExW     = modShell32.NewProc("ShellExecuteExW")
+	procOpenProcessToken    = modAdvapi32.NewProc("OpenProcessToken")
 	procGetTokenInformation = modAdvapi32.NewProc("GetTokenInformation")
 )
 
 const (
-	TOKEN_QUERY            = 0x0008
-	TokenElevation         = 20
+	TOKEN_QUERY             = 0x0008
+	TokenElevation          = 20
 	SEE_MASK_NOCLOSEPROCESS = 0x00000040
-	SW_NORMAL              = 1
+	SW_NORMAL               = 1
 )
 
 type tokenElevation struct {

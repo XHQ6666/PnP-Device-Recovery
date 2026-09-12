@@ -43,14 +43,14 @@ func (l *Logger) Close() error {
 	return err
 }
 
-func (l *Logger) rotateIfNeededLocked() error {
-	if l.size < maxLogBytes {
+// rotateIfNeededLocked truncates when current_size + nextBytes would exceed 10 MiB.
+func (l *Logger) rotateIfNeededLocked(nextBytes int) error {
+	if l.size+int64(nextBytes) <= maxLogBytes {
 		return nil
 	}
 	if err := l.file.Close(); err != nil {
 		return err
 	}
-	// Overwrite/truncate old content (not line-count based).
 	f, err := os.OpenFile(l.path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
 	if err != nil {
 		l.file = nil
@@ -76,7 +76,7 @@ func (l *Logger) Log(format string, args ...interface{}) {
 		fmt.Print(line)
 		return
 	}
-	if err := l.rotateIfNeededLocked(); err != nil {
+	if err := l.rotateIfNeededLocked(len(line)); err != nil {
 		fmt.Fprintf(os.Stderr, "log rotate error: %v\n", err)
 	}
 	n, err := l.file.WriteString(line)
