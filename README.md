@@ -1,5 +1,7 @@
 # PnP Device Recovery
 
+[中文](#pnp-device-recovery) | [English](#english)
+
 轻量级 **Windows PnP 设备自动恢复** 守护进程。
 
 在真实 Windows 环境中，部分设备节点会偶发进入异常状态（设备管理器中的问题代码，例如 Code 10 / 31 / 43）。本工具通过 Windows 原生 PnP 通知持续监听配置中的目标设备；一旦确认设备不健康，即在受控条件下自动执行一次软复位式恢复：
@@ -298,7 +300,7 @@ pnputil /enum-devices /problem
 └── src/                 # Go 源码与测试
     ├── go.mod
     ├── main.go
-    ├── … 
+    ├── …
 ```
 
 模块路径：`github.com/XHQ6666/PnP-Device-Recovery`
@@ -313,3 +315,325 @@ pnputil /enum-devices /problem
 ## 免责声明
 
 本软件按原样提供，不附带任何明示或暗示担保。使用前请自行评估 Disable / Enable 设备节点的风险。
+
+---
+
+<a id="english"></a>
+
+# English
+
+[中文](#pnp-device-recovery) | [English](#english)
+
+A lightweight **Windows PnP device auto-recovery** daemon.
+
+On real Windows systems, some device nodes occasionally enter a problem state (Device Manager problem codes such as Code 10 / 31 / 43). This tool listens for configured targets via native Windows PnP notifications and, when a device is unhealthy, performs a controlled soft reset:
+
+**Disable Device → wait → Enable Device → wait for driver re-initialization → re-check status**
+
+It calls SetupAPI / CfgMgr32 and related Windows APIs directly. It does **not** shell out to PowerShell, `pnputil`, or WMIC.
+
+> **Safety**  
+> Disable / Enable temporarily interrupts the device and may cause brief disconnects or output loss. Run elevated, and only in environments where you accept the risk. This tool cannot fix hardware failure, corrupted driver packages, firmware, or BIOS issues.
+
+---
+
+## What it is for
+
+| Scenario | Description |
+|----------|-------------|
+| Intermittent device faults | The device is still enumerated but has a Problem Code and does not work |
+| Automated soft reset | Manually Disable → Enable in Device Manager often helps; this automates it unattended |
+| Multiple devices | Monitor several devices in parallel, each with its own retry state |
+| At-startup tasks | Safe to run at logon/startup: it waits until the system is stable before the first scan, avoiding early-boot device operations |
+
+---
+
+## How it works
+
+```
+Windows PnP
+     │
+     ▼
+PnP Event (event-driven, not fixed polling)
+     │
+     ▼
+Trailing-edge coalescing
+     │
+     ▼
+Enumerate and match configured FriendlyName
+     │
+     ▼
+Read Status / ProblemCode
+     │
+ ┌───┴────┐
+OK     Problem
+ │         │
+done    Recovery Session
+           │
+       Disable
+           │
+        Enable
+           │
+      Re-check
+```
+
+**Monitoring**: prefers `CM_Register_Notification`; falls back to `RegisterDeviceNotification` + a hidden-window `WM_DEVICECHANGE` pump. The PnP callback **never** Disable/Enable — work is queued to workers.
+
+**Healthy** (CfgMgr32):
+
+- no `DN_HAS_PROBLEM`
+- `ProblemCode == 0`
+
+Anything else is treated as unhealthy (including but not limited to Codes 10 / 31 / 43).
+
+---
+
+## Startup sequence
+
+The daemon does **not** Disable/Enable devices immediately at process start. During early boot, Windows is still bringing up the user session and device stacks; operating too early can be unstable.
+
+```
+Process start
+  │
+  ├─ Parse CLI
+  ├─ Acquire single-instance mutex
+  ├─ UAC elevation if needed
+  │
+  ▼
+STARTING
+  │  Register PnP notifications
+  │  (events only mark pending — no Recovery)
+  │
+  ▼
+WAIT_FOR_SYSTEM_READY
+  │  Wait for an interactive session (e.g. WTSActive)
+  │  Soft signals such as Shell process presence
+  │  Internal safety buffer
+  │  (timeout continues with a warning — no infinite hang)
+  │
+  ▼
+INITIAL_SCAN (reason=startup)
+  │  First Recovery allowed only here
+  │
+  ▼
+NORMAL_RUNNING
+     Event-driven + trailing-edge coalescing
+```
+
+Ready-wait, safety buffer, and debounce intervals are **internal constants** and are **not** part of `config.json`.
+
+---
+
+## Features
+
+- **Event-driven PnP listening** (not fixed-interval polling)
+- **Exact FriendlyName** and `regex:` (Go RE2) matching
+- **Automatic Disable → Enable → re-check**
+- **Multi-device**: independent sessions and counters; parallel across devices, serial per device
+- **Trailing-edge coalescing**: bursts of PnP events collapse into one scan
+- **Exhausted state**: after `max_retries`, no more automatic recovery until `check`
+- **Deferred initial scan** after the system is ready
+- **Single instance + local named-pipe IPC**
+- **UAC auto-elevation**
+- **UTF-8 log**, max **10 MiB**, overwrite when exceeded
+
+---
+
+## Configuration
+
+Place `config.json` next to the executable. Keep the schema minimal — do not add startup delay, debounce, or poll-interval fields.
+
+```json
+{
+    "devices": [
+        {
+            "friendly_name": "Example Device Name",
+            "max_retries": 10
+        },
+        {
+            "friendly_name": "regex:^Example.*Adapter.*$",
+            "max_retries": 5
+        }
+    ],
+    "retry_delay": 2,
+    "log_file": "PnP-Device-Recovery.log"
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `devices[].friendly_name` | Exact Device Manager friendly name, or `regex:` + Go RE2 |
+| `devices[].max_retries` | Max attempts per Recovery Session (must be > 0) |
+| `retry_delay` | Seconds to wait after Disable / Enable (must be ≥ 0) |
+| `log_file` | Log path (must be non-empty) |
+
+If a target is missing at startup, the process logs “device not found” and keeps listening.
+
+### Matching rules
+
+- Plain string: **exact** FriendlyName match
+- `regex:…`: strip the prefix and compile with Go RE2 (no PCRE lookaround)
+
+Instance ID comparison is **case-insensitive**.
+
+---
+
+## Recovery behavior
+
+```
+Unhealthy (and not Exhausted)
+    ↓
+Start Recovery Session (coalesce per device; no concurrent sessions)
+    ↓
+Disable → wait retry_delay → Enable → wait → re-check
+    ↓
+┌──────────┴──────────┐
+Success                Still unhealthy
+ ↓                      ↓
+Reset to Idle          attempt + 1
+                        ↓
+                   Under max_retries?
+                   ┌────┴────┐
+                   Yes       No
+                   ↓         ↓
+                 Retry    Mark Exhausted
+                          (global listener continues;
+                           no auto Recovery for this device)
+```
+
+- Hitting `max_retries` does **not** `os.Exit()` and does **not** stop the global PnP listener
+- Exhausted devices only log on ordinary PnP events; no new automatic session
+- Only `PnP-Device-Recovery.exe check` clears Exhausted and rescans; a new session starts at attempt = 1 if still unhealthy
+
+---
+
+## Command line
+
+```text
+PnP-Device-Recovery.exe              Run daemon (single instance)
+PnP-Device-Recovery.exe check        Clear Exhausted and rescan
+PnP-Device-Recovery.exe status       Show daemon status
+PnP-Device-Recovery.exe help         Usage (-h / --help also work)
+```
+
+| Command | Behavior |
+|---------|----------|
+| (none) | Daemon: mutex → UAC → register PnP → wait until ready → initial scan → event loop |
+| `check` | IPC to the running daemon; if none, one-shot check then exit (no second resident listener) |
+| `status` | IPC status dump; if not running, print `not running` and exit 0 |
+| `help` | Print usage and exit (no mutex) |
+| unknown | Print usage and exit non-zero |
+
+- Mutex: `Global\PnPDeviceRecovery_SingleInstance`
+- Pipe: `\\.\pipe\PnPDeviceRecovery` (remote clients rejected)
+
+`status` includes phase (`STARTING` / `WAIT_FOR_SYSTEM_READY` / `NORMAL_RUNNING`), whether the listener is registered, and per configured device: Instance ID, health, ProblemCode, Idle / Recovering / Exhausted, attempt, and `max_retries`.
+
+---
+
+## Logging
+
+- Encoding: UTF-8
+- No line-count limit
+- Size cap: `10 * 1024 * 1024` (10 MiB)
+- Before write: if `current_size + line_length` would exceed the cap, truncate then write
+
+Typical fields: time, FriendlyName, Instance ID, Status, ProblemCode, scan reason (`startup` / `pnp_event` / `recovery_postcheck`), trigger event, Recovery attempt, Disable/Enable API results, final outcome.
+
+---
+
+## Build
+
+Sources live under `src/`.
+
+```bat
+cd src
+set GOOS=windows
+set GOARCH=amd64
+set CGO_ENABLED=0
+go build -trimpath -ldflags="-s -w" -o ..\PnP-Device-Recovery.exe .
+```
+
+Cross-compile on Linux / macOS:
+
+```bash
+cd src
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../PnP-Device-Recovery.exe .
+```
+
+Recommended tests:
+
+```bash
+cd src
+go test ./...
+go test -race ./...
+```
+
+Place `PnP-Device-Recovery.exe` and `config.json` in the same folder. Run elevated, or rely on built-in UAC relaunch.
+
+---
+
+## Limitations
+
+- Real PnP / SetupAPI / CfgMgr32 / UAC / named pipes exist only on Windows
+- **Not** a universal driver fixer: it cannot guarantee fixes for hardware failure, corrupted packages, firmware/BIOS, or display-stack defects
+- Disable / Enable is only a soft reset of the device node
+- After Exhausted, you must run `check` (or restart the daemon) to retry that device automatically
+- Administrator rights are required
+
+---
+
+## Troubleshooting
+
+These commands are for **manual** diagnosis only; the program does **not** invoke them:
+
+```bat
+pnputil /enum-devices /problem
+```
+
+| Symptom | Likely cause |
+|---------|----------------|
+| Exits immediately | Invalid `config.json`, or single-instance mutex already held |
+| Still exits after UAC | Elevation denied |
+| `status` → not running | Daemon not started |
+| No auto recovery after Exhausted | Expected; run `check` |
+| Long delay before first scan | Waiting for session ready + internal buffer |
+| Device not found | FriendlyName mismatch; try `regex:` |
+| Log suddenly short | Exceeded 10 MiB; truncated before write |
+| Disable / Enable failed | Check log for `api=… result=CR_xxx` |
+
+---
+
+## Case study: discrete GPU Code 43
+
+This is one real-world usage example, not the only purpose. Any PnP device that matches by FriendlyName and benefits from Disable/Enable can be configured.
+
+A laptop dGPU occasionally entered **Code 43**. After putting its FriendlyName (e.g. `NVIDIA GeForce RTX 3060 Laptop GPU`) in `config.json`, the tool detected the fault on the post-ready initial scan, ran Disable → Enable, observed related GPU / Display PnP arrival/removal events, then saw ProblemCode return to 0 and Recovery succeed.
+
+On some **dGPU-only / MUX** machines, Disable/Enable of the GPU before the display stack is stable can blank the screen. That is one reason this tool waits for system readiness before the first scan — the same policy helps other devices that are unstable early in boot.
+
+---
+
+## Layout
+
+```
+├── README.md
+├── config.json          # sample config
+└── src/                 # Go sources and tests
+    ├── go.mod
+    ├── main.go
+    ├── …
+```
+
+Module path: `github.com/XHQ6666/PnP-Device-Recovery`
+
+| Build tags | Role |
+|------------|------|
+| `*_windows.go` | SetupAPI / CfgMgr32 / PnP / UAC / WTS / named pipe / mutex |
+| `*_other.go` | Non-Windows stubs for Linux unit tests |
+
+---
+
+## Disclaimer
+
+Provided as-is, without warranty of any kind. Evaluate the risk of Disable / Enable before use.
