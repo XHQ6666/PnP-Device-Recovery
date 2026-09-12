@@ -325,7 +325,7 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 			}
 		}
 
-		rm.logger.Infof("post-recovery status: name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d healthy=%v",
+		rm.logger.Infof("scan/recheck: reason=recovery_postcheck name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d healthy=%v",
 			post.FriendlyName, post.InstanceID, post.DevInst, post.Status, post.ProblemCode, post.IsHealthy())
 
 		if post.IsHealthy() {

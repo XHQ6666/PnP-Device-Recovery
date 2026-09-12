@@ -90,6 +90,19 @@ func runOneShotCheck() int {
 		return 1
 	}
 
+	// Same singleton as the daemon so concurrent one-shot checks cannot overlap.
+	release, err := AcquireSingleton()
+	if err != nil {
+		if errors.Is(err, ErrAlreadyRunning) {
+			logger.Errorf("%v", err)
+			fmt.Fprintf(os.Stderr, "another instance is already running\n")
+			return 1
+		}
+		logger.Errorf("singleton: %v", err)
+		return 1
+	}
+	defer release()
+
 	matchers, err := BuildMatchers(cfg.Devices)
 	if err != nil {
 		logger.Errorf("matcher build failed: %v", err)
