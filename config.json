@@ -1,0 +1,14 @@
+{
+    "devices": [
+        {
+            "friendly_name": "NVIDIA GeForce RTX 3060 Laptop GPU",
+            "max_retries": 10
+        },
+        {
+            "friendly_name": "regex:^Intel.*BE200.*$",
+            "max_retries": 5
+        }
+    ],
+    "retry_delay": 2,
+    "log_file": "PnP-Device-Recovery.log"
+}
