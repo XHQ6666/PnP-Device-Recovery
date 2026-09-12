@@ -7,6 +7,11 @@ Windows 即插即用（PnP）设备自动恢复工具。通过 **事件驱动** 
 
 ---
 
+## 目录结构
+
+- 根目录：`README.md`、`config.json`（示例配置）
+- `src/`：全部 Go 源码（`go.mod`、`*.go`、测试）
+
 ## 工作原理
 
 ```
@@ -51,7 +56,7 @@ Status / ProblemCode
 - **UAC**：未提升时 `ShellExecuteEx` + `runas`；用户拒绝则记日志并干净退出。
 - **日志**：UTF-8；超过 **10×1024×1024** 字节后截断覆盖（按字节，非按行）。
 - **优雅关闭**：SIGINT/SIGTERM → 停止新恢复 → 注销 PnP → 等待 worker → 关闭日志。
-- **交叉编译**：`GOOS=windows` 真实实现；Linux 下 stub + `go test` 覆盖配置/匹配/日志/恢复状态机。
+- **交叉编译**：`GOOS=windows` 真实实现；Linux 下 stub + `cd src && go test ./...` 覆盖配置/匹配/日志/恢复状态机。
 
 ---
 
@@ -135,7 +140,8 @@ Status / ProblemCode
 
 ```bash
 cd /workspace/PnP-Device-Recovery
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o PnP-Device-Recovery.exe .
+cd src
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o ../PnP-Device-Recovery.exe .
 ```
 
 验证：
@@ -148,7 +154,7 @@ sha256sum PnP-Device-Recovery.exe
 ### Linux 测试（stub + 纯逻辑）
 
 ```bash
-go test ./...
+cd src && go test ./...
 ```
 
 ### 在 Windows 上运行
