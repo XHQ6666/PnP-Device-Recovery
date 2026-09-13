@@ -35,10 +35,10 @@ const (
 
 var (
 	modWtsapi32                      = windows.NewLazySystemDLL("wtsapi32.dll")
-	modUser32                        = windows.NewLazySystemDLL("user32.dll")
 	procWTSQuerySessionInformationW  = modWtsapi32.NewProc("WTSQuerySessionInformationW")
 	procWTSFreeMemory                = modWtsapi32.NewProc("WTSFreeMemory")
 	procWTSGetActiveConsoleSessionId = modKernel32.NewProc("WTSGetActiveConsoleSessionId")
+	// modUser32 is declared in pnp_windows.go (same package).
 	procOpenInputDesktop             = modUser32.NewProc("OpenInputDesktop")
 	procCloseDesktop                 = modUser32.NewProc("CloseDesktop")
 	procGetUserObjectInformationW    = modUser32.NewProc("GetUserObjectInformationW")
