@@ -10,7 +10,7 @@ import (
 func TestLoggerWriteAndRotate(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "t.log")
-	lg, err := NewLogger(path)
+	lg, err := NewLoggerAtPath(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -18,6 +18,7 @@ func TestLoggerWriteAndRotate(t *testing.T) {
 	lg.Infof("info line")
 	lg.Warnf("warn line")
 	lg.Errorf("err line")
+	lg.Debugf("should not appear at normal")
 
 	// Force rotation by setting size past limit
 	lg.mu.Lock()
@@ -40,12 +41,50 @@ func TestLoggerWriteAndRotate(t *testing.T) {
 	if !strings.Contains(s, "log rotated") {
 		t.Fatalf("expected rotation header, got %q", s)
 	}
+	if strings.Contains(s, "should not appear") {
+		t.Fatal("debug line must not appear at normal level")
+	}
+}
+
+func TestLoggerDebugLevel(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dbg.log")
+	lg, err := NewLogger(&LogConfig{Enabled: true, Level: LogLevelDebug, Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Debugf("debug detail %d", 42)
+	_ = lg.Close()
+	data, _ := os.ReadFile(path)
+	if !strings.Contains(string(data), "debug detail 42") {
+		t.Fatalf("expected debug line, got %q", data)
+	}
+}
+
+func TestLoggerDisabledNoOp(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "disabled.log")
+	lg, err := NewLogger(&LogConfig{Enabled: false, Level: LogLevelDebug, Path: path})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg.Infof("nope")
+	lg.Debugf("nope2")
+	lg.Warnf("nope3")
+	lg.Errorf("nope4")
+	_ = lg.Close()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("disabled logger must not create file, err=%v", err)
+	}
+	if lg.Enabled() {
+		t.Fatal("Enabled should be false")
+	}
 }
 
 func TestLoggerUTF8(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "utf8.log")
-	lg, err := NewLogger(path)
+	lg, err := NewLoggerAtPath(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +99,7 @@ func TestLoggerUTF8(t *testing.T) {
 func TestLoggerSizeBeforeWrite(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "before.log")
-	lg, err := NewLogger(path)
+	lg, err := NewLoggerAtPath(path)
 	if err != nil {
 		t.Fatal(err)
 	}

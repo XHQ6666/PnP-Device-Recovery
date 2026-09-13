@@ -12,11 +12,9 @@ import (
 )
 
 // Internal constants — not part of config.json.
-// Ready = console session up + lock/logon UI (LogonUI), then a short fixed buffer.
+// Ready = input desktop Winlogon (lock) with console session up, OR Default (desktop/auto-logon).
 const (
 	readyPollInterval = 500 * time.Millisecond
-	readyPostReadyMin = 3 * time.Second  // minimum wait after lock-screen ready before Initial Scan
-	readyLogonUIGrace = 5 * time.Second  // if session is up but LogonUI never appears (e.g. auto-logon)
 	readyMaxWait      = 1 * time.Minute
 )
 
@@ -29,11 +27,21 @@ const (
 	invalidSessionID       = 0xFFFFFFFF
 )
 
+// Desktop / user-object constants
+const (
+	desktopReadObjects = 0x0001
+	uoiName            = 2 // UOI_NAME
+)
+
 var (
 	modWtsapi32                      = windows.NewLazySystemDLL("wtsapi32.dll")
+	modUser32                        = windows.NewLazySystemDLL("user32.dll")
 	procWTSQuerySessionInformationW  = modWtsapi32.NewProc("WTSQuerySessionInformationW")
 	procWTSFreeMemory                = modWtsapi32.NewProc("WTSFreeMemory")
 	procWTSGetActiveConsoleSessionId = modKernel32.NewProc("WTSGetActiveConsoleSessionId")
+	procOpenInputDesktop             = modUser32.NewProc("OpenInputDesktop")
+	procCloseDesktop                 = modUser32.NewProc("CloseDesktop")
+	procGetUserObjectInformationW    = modUser32.NewProc("GetUserObjectInformationW")
 )
 
 func activeConsoleSessionID() uint32 {
@@ -72,79 +80,104 @@ func sessionStateReady(state uint32) bool {
 	return state == wtsActive || state == wtsConnected
 }
 
-func processPresent(exeName string) bool {
-	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil {
-		return false
+// inputDesktopName returns the UOI_NAME of the current input desktop, or ("", false).
+func inputDesktopName() (string, bool) {
+	if err := procOpenInputDesktop.Find(); err != nil {
+		return "", false
 	}
-	defer windows.CloseHandle(snap)
-	var entry windows.ProcessEntry32
-	entry.Size = uint32(unsafe.Sizeof(entry))
-	if err := windows.Process32First(snap, &entry); err != nil {
-		return false
+	if err := procGetUserObjectInformationW.Find(); err != nil {
+		return "", false
 	}
-	for {
-		name := windows.UTF16ToString(entry.ExeFile[:])
-		if strings.EqualFold(name, exeName) {
-			return true
-		}
-		if err := windows.Process32Next(snap, &entry); err != nil {
-			break
-		}
+	h, _, _ := procOpenInputDesktop.Call(
+		0,
+		0, // fInherit = FALSE
+		uintptr(desktopReadObjects),
+	)
+	if h == 0 {
+		return "", false
 	}
-	return false
+	defer procCloseDesktop.Call(h)
+
+	var needed uint32
+	procGetUserObjectInformationW.Call(
+		h,
+		uintptr(uoiName),
+		0,
+		0,
+		uintptr(unsafe.Pointer(&needed)),
+	)
+	if needed == 0 {
+		needed = 256
+	}
+	buf := make([]uint16, needed/2+2)
+	var got uint32
+	r, _, _ := procGetUserObjectInformationW.Call(
+		h,
+		uintptr(uoiName),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)*2),
+		uintptr(unsafe.Pointer(&got)),
+	)
+	if r == 0 {
+		return "", false
+	}
+	return windows.UTF16ToString(buf), true
 }
 
-func logonUIPresent() bool {
-	return processPresent("LogonUI.exe")
+// systemReady reports whether the input desktop indicates an interactive lock or desktop.
+// Ready when EITHER:
+//  1. desktop name is "Winlogon" AND console session Connected/Active, OR
+//  2. desktop name is "Default"
+func systemReady(logger *Logger) bool {
+	name, ok := inputDesktopName()
+	if !ok {
+		if logger != nil {
+			logger.Debugf("ready poll: OpenInputDesktop/GetUserObjectInformationW failed")
+		}
+		return false
+	}
+	if logger != nil {
+		logger.Debugf("ready poll: input desktop=%q", name)
+	}
+	switch {
+	case strings.EqualFold(name, "Default"):
+		return true
+	case strings.EqualFold(name, "Winlogon"):
+		sid := activeConsoleSessionID()
+		state, sok := querySessionState(sid)
+		if logger != nil {
+			logger.Debugf("ready poll: Winlogon desktop; session_id=%d state_ok=%v state=%d", sid, sok, state)
+		}
+		return sid != invalidSessionID && sok && sessionStateReady(state)
+	default:
+		return false
+	}
 }
 
-// WaitForSystemReady waits until the console session is Connected/Active and the
-// lock/logon UI is likely up (LogonUI.exe), then applies a minimum post-ready
-// buffer (3s) before Initial Scan. It does not wait for explorer/desktop.
-// After readyMaxWait it proceeds with a warning instead of hanging forever.
+// WaitForSystemReady waits until the input desktop is Winlogon (with console session
+// Connected/Active) or Default. It does not wait for explorer/desktop beyond Default,
+// and no longer uses LogonUI.exe or uptime. After readyMaxWait it proceeds with a
+// warning instead of hanging forever.
 func WaitForSystemReady(ctx context.Context, logger *Logger) error {
 	if logger != nil {
-		logger.Infof("WAIT_FOR_SYSTEM_READY: waiting for console session Connected/Active and LogonUI (lock screen)")
+		logger.Infof("WAIT_FOR_SYSTEM_READY: waiting for input desktop Winlogon (session Connected/Active) or Default")
 	}
 	deadline := time.Now().Add(readyMaxWait)
-	var sessionReadyAt time.Time
-	sessionReady := false
 
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		sid := activeConsoleSessionID()
-		state, ok := querySessionState(sid)
-		if sid != invalidSessionID && ok && sessionStateReady(state) {
-			if !sessionReady {
-				sessionReady = true
-				sessionReadyAt = time.Now()
-				if logger != nil {
-					logger.Infof("console session ready: session_id=%d state=%d (0=Active 1=Connected)", sid, state)
-				}
+		if systemReady(logger) {
+			name, _ := inputDesktopName()
+			if logger != nil {
+				logger.Infof("system ready: input desktop=%q", name)
 			}
-			if logonUIPresent() {
-				if logger != nil {
-					logger.Infof("soft signal: LogonUI.exe present (lock/logon UI)")
-				}
-				break
-			}
-			if time.Since(sessionReadyAt) >= readyLogonUIGrace {
-				if logger != nil {
-					logger.Warnf("LogonUI.exe not found after %s; proceeding on session state only (e.g. auto-logon)", readyLogonUIGrace)
-				}
-				break
-			}
+			return nil
 		}
 		if time.Now().After(deadline) {
 			if logger != nil {
 				logger.Warnf("WAIT_FOR_SYSTEM_READY timed out after %s; proceeding with warning", readyMaxWait)
-			}
-			// Still apply the minimum post-ready buffer when possible.
-			if !sleepOrDone(ctx, readyPostReadyMin) {
-				return ctx.Err()
 			}
 			return nil
 		}
@@ -152,12 +185,4 @@ func WaitForSystemReady(ctx context.Context, logger *Logger) error {
 			return ctx.Err()
 		}
 	}
-
-	if logger != nil {
-		logger.Infof("lock-screen ready: applying minimum post-ready buffer %s before Initial Scan", readyPostReadyMin)
-	}
-	if !sleepOrDone(ctx, readyPostReadyMin) {
-		return ctx.Err()
-	}
-	return nil
 }

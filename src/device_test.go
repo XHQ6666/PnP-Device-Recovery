@@ -29,3 +29,19 @@ func TestIsHealthyTable(t *testing.T) {
 		t.Fatal("nil should not be healthy")
 	}
 }
+
+
+func TestIsDisabledEnabled(t *testing.T) {
+	var nilDev *DeviceInfo
+	if nilDev.IsDisabled() || nilDev.IsEnabled() {
+		t.Fatal("nil")
+	}
+	d := &DeviceInfo{Status: DN_HAS_PROBLEM, ProblemCode: CM_PROB_DISABLED}
+	if !d.IsDisabled() || d.IsEnabled() {
+		t.Fatal("disabled")
+	}
+	e := &DeviceInfo{Status: DN_STARTED, ProblemCode: 43}
+	if e.IsDisabled() || !e.IsEnabled() {
+		t.Fatal("enabled despite problem")
+	}
+}

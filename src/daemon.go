@@ -21,6 +21,7 @@ type ScanReason struct {
 	Reason          string
 	TriggerInstance string
 	TriggerAction   string
+	IgnoreDelay     bool // true for IPC/CLI check — recover immediately despite devices[].delay
 }
 
 // eventCoalescer is a trailing-edge debounce: each Trigger resets the timer;
@@ -196,8 +197,8 @@ func (d *Daemon) HandleIPC(req IPCRequest) IPCResponse {
 	case "status":
 		return IPCResponse{OK: true, Status: d.Snapshot()}
 	case "check":
-		d.logger.Infof("IPC check: clearing Exhausted and rescanning")
-		d.rm.Scan(d.ctx, ScanReason{Reason: "check"})
+		d.logger.Infof("IPC check: clearing Exhausted and rescanning (IgnoreDelay)")
+		d.rm.Scan(d.ctx, ScanReason{Reason: "check", IgnoreDelay: true})
 		return IPCResponse{OK: true, Status: d.Snapshot()}
 	default:
 		return IPCResponse{OK: false, Error: "unknown cmd"}

@@ -22,7 +22,7 @@
 | 设备偶发异常 | 设备仍在系统中枚举，但带有 Problem Code，功能不可用 |
 | 需要自动软复位 | 手工在设备管理器中「禁用 → 启用」往往有效，希望无人值守自动完成 |
 | 多设备并行监控 | 可同时监控多块不同设备，各自独立重试与状态 |
-| 开机计划任务 | 可作为开机启动项运行，但会等待系统进入稳定阶段后再做首次扫描，避免启动早期过早操作设备 |
+| 开机计划任务 | 可作为开机启动项运行；Ready（Winlogon/Default）后再首次扫描，并可按设备配置 delay |
 
 ---
 
@@ -68,7 +68,7 @@ PnP Event（事件驱动，非固定轮询）
 
 ## 启动时序
 
-守护进程不会在进程一启动就对设备执行 Disable / Enable。过早操作（例如仍在 Boot 画面）可能不稳定。Ready 点取 **锁屏 / 登录 UI**，不必等到用户解锁进桌面。
+守护进程不会在进程一启动就对设备执行 Disable / Enable。过早操作（例如仍在 Boot 画面）可能不稳定。Ready 判定基于 **输入桌面名称**（不必等到用户解锁进桌面）。
 
 ```
 进程启动
@@ -84,22 +84,22 @@ STARTING
   │
   ▼
 WAIT_FOR_SYSTEM_READY
-  │  控制台会话 Connected / Active
-  │  LogonUI.exe（锁屏/登录 UI）软信号
-  │  若无 LogonUI（如自动登录）：会话就绪后再宽限约 5s
-  │  然后固定再等约 3s（内部最小值）
-  │  （总超时约 1 分钟；超时后带警告继续，避免永久挂起）
+  │  OpenInputDesktop + UOI_NAME：
+  │    - 输入桌面为 "Winlogon" 且控制台会话 Connected/Active（锁屏可交互）
+  │    - 或输入桌面为 "Default"（自动登录 / 桌面）
+  │  （内部轮询；总超时约 1 分钟；超时后带警告继续，避免永久挂起）
+  │  不再使用 LogonUI.exe / 开机时长作为就绪条件
   │
   ▼
 INITIAL_SCAN（reason=startup）
-  │  此时才允许首次 Recovery
+  │  此时才允许首次自动 Recovery（仍受 devices[].delay / ProblemCode 约束）
   │
   ▼
 NORMAL_RUNNING
      事件驱动 + 尾沿合并
 ```
 
-不等待 `explorer.exe` / 完整桌面。就绪等待与 3 秒缓冲均为 **内部常量**，不会出现在 `config.json` 中。
+不等待 `explorer.exe`。就绪轮询间隔与总超时为 **内部常量**，不会出现在 `config.json` 中。额外的每设备自动恢复延迟请用 `devices[].delay`。
 
 ---
 
@@ -111,40 +111,53 @@ NORMAL_RUNNING
 - **多设备**：独立会话、独立重试计数；不同设备可并行，同一设备串行
 - **尾沿事件合并**：短时间内连续 PnP 事件合并为一次扫描，减轻枚举风暴
 - **Exhausted 状态**：达到 `max_retries` 后该设备停止自动恢复；仅 `check` 可清除并重试
-- **启动延迟扫描**：到锁屏/登录 UI 后再做首次扫描（另有约 3s 内部最小缓冲）
+- **Ready 后再首次扫描**：输入桌面 Winlogon（会话就绪）或 Default
+- **每设备 delay / ProblemCode**：自动 Recover 可延后；可按问题代码过滤
+- **Disable/Enable 状态门闩**：仅在设备当前为启用时 Disable，仅在已禁用时 Enable
 - **单实例 + 本地命名管道 IPC**
 - **UAC 自动提权**
-- **UTF-8 日志**，上限 10 MiB，超出后覆盖旧内容
+- **UTF-8 日志**（`log` 对象）：可关闭；`normal`/`debug`；上限 10 MiB
 
 ---
 
 ## 配置
 
-将 `config.json` 与可执行文件放在同一目录。配置结构保持精简，请勿自行添加启动延时、防抖、轮询间隔等字段。
+将 `config.json` 与可执行文件放在同一目录。`log` 对象为 **必填**。相对日志路径相对于 **可执行文件目录**（不是进程 cwd）。**不再支持**旧字段 `log_file`。
 
 ```json
 {
-    "devices": [
-        {
-            "friendly_name": "Example Device Name",
-            "max_retries": 10
-        },
-        {
-            "friendly_name": "regex:^Example.*Adapter.*$",
-            "max_retries": 5
-        }
-    ],
-    "retry_delay": 2,
-    "log_file": "PnP-Device-Recovery.log"
+  "log": {
+    "enabled": true,
+    "level": "normal",
+    "path": ""
+  },
+  "devices": [
+    {
+      "friendly_name": "Example Device Name",
+      "max_retries": 10,
+      "delay": 60,
+      "ProblemCode": [43]
+    },
+    {
+      "friendly_name": "regex:^Example.*Adapter.*$",
+      "max_retries": 5
+    }
+  ],
+  "retry_delay": 2
 }
 ```
 
 | 字段 | 说明 |
 |------|------|
+| `log` | **必填**对象 |
+| `log.enabled` | `false` 时不写文件、不向控制台打印 |
+| `log.level` | `"normal"` 或 `"debug"`（debug 含跳过原因、Ready 轮询细节等） |
+| `log.path` | 日志路径；空/省略 → 可执行文件目录下 `PnP-Device-Recovery.log`；相对路径相对 exe 目录；绝对路径亦可 |
 | `devices[].friendly_name` | 与设备管理器中的友好名称完全一致；或以 `regex:` 开头使用 Go RE2 |
 | `devices[].max_retries` | 单次 Recovery Session 的最大尝试次数（必须 > 0） |
-| `retry_delay` | Disable / Enable 之后的等待秒数（必须 ≥ 0） |
-| `log_file` | 日志文件路径（不可为空） |
+| `devices[].delay` | 进程启动后多少秒才允许 **自动** Recover；省略 = 0；`check` **忽略** delay |
+| `devices[].ProblemCode` | 单个数字或数字数组；仅当设备当前 ProblemCode 落在集合内才 Recover；省略 = 不额外过滤 |
+| `retry_delay` | Disable / Enable 之后的等待秒数（必须 ≥ 0；全局） |
 
 启动时若目标设备尚未枚举：记录「device not found」并继续监听，待后续 PnP 事件再处理。
 
@@ -162,9 +175,18 @@ Instance ID 比较 **不区分大小写**，避免同一设备因大小写差异
 ```
 发现异常（且非 Exhausted）
     ↓
+自动路径：未满 devices[].delay？→ 跳过，继续监听
+ProblemCode 已配置且不匹配？→ 跳过
+    ↓
 开启 Recovery Session（同设备事件合并，不并发）
     ↓
-Disable → 等待 retry_delay → Enable → 等待 → 复查
+若当前为启用 → Disable；若已禁用则跳过 Disable（不强制）
+    ↓
+等待 retry_delay
+    ↓
+若当前为禁用 → Enable；若已启用则跳过 Enable（不强制）
+    ↓
+等待 → 复查
     ↓
 ┌──────────┴──────────┐
 成功                   仍异常
@@ -182,7 +204,8 @@ Disable → 等待 retry_delay → Enable → 等待 → 复查
 
 - 达到 `max_retries` **不会** `os.Exit()`，也 **不会** 停止全局 PnP 监听
 - Exhausted 设备遇到普通 PnP 事件只记录状态，不自动开新会话
-- 只有执行 `PnP-Device-Recovery.exe check` 才会清除 Exhausted 并重新检测；若仍异常，新会话从 attempt = 1 开始
+- `PnP-Device-Recovery.exe check` 清除 Exhausted 并重新检测；**忽略** `delay`，但仍应用 ProblemCode 过滤与 Disable/Enable 状态门闩；若仍异常，新会话从 attempt = 1 开始
+- 禁用/启用判定：CfgMgr `CM_PROB_DISABLED`（22）；设备可「已启用但仍不健康」（如 Code 43）
 
 ---
 
@@ -212,10 +235,13 @@ PnP-Device-Recovery.exe help         显示用法（亦支持 -h / --help）
 
 ## 日志
 
+- 由 `log` 对象控制；`enabled=false` 时无文件、无控制台输出
+- `level=debug` 时额外记录跳过原因、Ready 轮询细节等
 - 编码：UTF-8
 - 不限制行数
-- 大小上限：`10 * 1024 * 1024`（10 MiB）
+- 大小上限：`10 * 1024 * 1024`（10 MiB）；启用时超出则覆盖
 - 写入前若 `当前大小 + 本行长度` 将超过上限，先覆盖（截断）旧内容再写入
+- 默认文件名：`PnP-Device-Recovery.log`（exe 同目录）
 
 典型字段包括：时间、FriendlyName、Instance ID、Status、ProblemCode、扫描原因（`startup` / `pnp_event` / `recovery_postcheck`）、触发事件、Recovery attempt、Disable/Enable 的 API 结果、最终结果等。
 
@@ -276,7 +302,7 @@ pnputil /enum-devices /problem
 | UAC 后仍退出 | 用户拒绝提升权限 |
 | `status` 显示 not running | 守护进程未启动 |
 | Exhausted 后不再自动恢复 | 预期行为；运行 `check` |
-| 启动后较久才第一次扫描 | 正在等待会话/LogonUI 与约 3s 最小缓冲 |
+| 启动后较久才第一次扫描 | 正在等待输入桌面 Winlogon/Default（最长约 1 分钟）或 `devices[].delay` |
 | 找不到设备 | FriendlyName 与设备管理器不一致；可改用 `regex:` |
 | 日志突然变短 | 已超过 10 MiB，写入前截断覆盖 |
 | Disable / Enable 失败 | 查看日志中的 `api=… result=CR_xxx` |
@@ -289,7 +315,7 @@ pnputil /enum-devices /problem
 
 某笔记本独显偶发进入 **Code 43**。将 FriendlyName（例如 `NVIDIA GeForce RTX 3060 Laptop GPU`）写入 `config.json` 后，程序在系统就绪并完成初始扫描时检测到异常，执行 Disable → Enable；随后可见相关 GPU / Display 等 PnP 到达与移除事件，复查后 ProblemCode 回到 0，Recovery 成功。
 
-在 **dGPU-only / MUX** 等机器上，若在 Boot 画面阶段就对 GPU 做 Disable/Enable，可能造成显示输出异常甚至黑屏。本工具因此等到锁屏/登录 UI 后再做首次扫描（并加约 3s 最小缓冲）；该策略对其他在启动早期尚不稳定的设备同样适用。
+在 **dGPU-only / MUX** 等机器上，若在 Boot 画面阶段就对 GPU 做 Disable/Enable，可能造成显示输出异常甚至黑屏。本工具因此等到输入桌面为 Winlogon（会话 Connected/Active）或 Default，并可配合 `devices[].delay` 再延后自动 Recover；该策略对其他在启动早期尚不稳定的设备同样适用。
 
 ---
 
@@ -391,7 +417,7 @@ Anything else is treated as unhealthy (including but not limited to Codes 10 / 3
 
 ## Startup sequence
 
-The daemon does **not** Disable/Enable devices immediately at process start. Ready means **lock / logon UI**, not a fully loaded desktop after unlock.
+The daemon does **not** Disable/Enable devices immediately at process start. Ready is based on the **input desktop name** (you do not need a fully unlocked desktop).
 
 ```
 Process start
@@ -407,22 +433,22 @@ STARTING
   │
   ▼
 WAIT_FOR_SYSTEM_READY
-  │  Console session Connected / Active
-  │  LogonUI.exe soft signal (lock/logon UI)
-  │  If no LogonUI (e.g. auto-logon): ~5s grace after session ready
-  │  Then a fixed ~3s minimum buffer
-  │  (overall timeout ~1 minute; then continue with a warning — no infinite hang)
+  │  OpenInputDesktop + UOI_NAME:
+  │    - input desktop "Winlogon" AND console session Connected/Active (interactive lock)
+  │    - OR input desktop "Default" (auto-logon / desktop)
+  │  (internal poll; overall timeout ~1 minute; then continue with a warning — no infinite hang)
+  │  LogonUI.exe / uptime are NOT used
   │
   ▼
 INITIAL_SCAN (reason=startup)
-  │  First Recovery allowed only here
+  │  First automatic Recovery allowed here (still subject to devices[].delay / ProblemCode)
   │
   ▼
 NORMAL_RUNNING
      Event-driven + trailing-edge coalescing
 ```
 
-It does **not** wait for `explorer.exe` / full desktop. Ready-wait and the 3s buffer are **internal constants**, not `config.json` fields.
+It does **not** wait for `explorer.exe`. Ready poll interval and max wait are **internal constants**, not `config.json` fields. Use `devices[].delay` for an extra per-device automatic-recover delay.
 
 ---
 
@@ -434,40 +460,53 @@ It does **not** wait for `explorer.exe` / full desktop. Ready-wait and the 3s bu
 - **Multi-device**: independent sessions and counters; parallel across devices, serial per device
 - **Trailing-edge coalescing**: bursts of PnP events collapse into one scan
 - **Exhausted state**: after `max_retries`, no more automatic recovery until `check`
-- **Deferred initial scan** after lock/logon UI is ready (plus ~3s internal minimum buffer)
+- **Ready before first scan**: input desktop Winlogon (session ready) or Default
+- **Per-device delay / ProblemCode**: defer automatic Recover; filter by problem codes
+- **Disable/Enable state gates**: Disable only when enabled; Enable only when disabled
 - **Single instance + local named-pipe IPC**
 - **UAC auto-elevation**
-- **UTF-8 log**, max **10 MiB**, overwrite when exceeded
+- **UTF-8 log** (`log` object): can disable; `normal`/`debug`; max **10 MiB**
 
 ---
 
 ## Configuration
 
-Place `config.json` next to the executable. Keep the schema minimal — do not add startup delay, debounce, or poll-interval fields.
+Place `config.json` next to the executable. The `log` object is **required**. Relative log paths resolve against the **executable directory** (not the process cwd). The old `log_file` field is **not** supported.
 
 ```json
 {
-    "devices": [
-        {
-            "friendly_name": "Example Device Name",
-            "max_retries": 10
-        },
-        {
-            "friendly_name": "regex:^Example.*Adapter.*$",
-            "max_retries": 5
-        }
-    ],
-    "retry_delay": 2,
-    "log_file": "PnP-Device-Recovery.log"
+  "log": {
+    "enabled": true,
+    "level": "normal",
+    "path": ""
+  },
+  "devices": [
+    {
+      "friendly_name": "Example Device Name",
+      "max_retries": 10,
+      "delay": 60,
+      "ProblemCode": [43]
+    },
+    {
+      "friendly_name": "regex:^Example.*Adapter.*$",
+      "max_retries": 5
+    }
+  ],
+  "retry_delay": 2
 }
 ```
 
 | Field | Meaning |
 |-------|---------|
+| `log` | **Required** object |
+| `log.enabled` | When `false`: no file writes and no console prints |
+| `log.level` | `"normal"` or `"debug"` (debug includes skip reasons, Ready poll details, etc.) |
+| `log.path` | Log path; empty/omit → `PnP-Device-Recovery.log` under the exe directory; relative paths are relative to the exe directory; absolute paths OK |
 | `devices[].friendly_name` | Exact Device Manager friendly name, or `regex:` + Go RE2 |
 | `devices[].max_retries` | Max attempts per Recovery Session (must be > 0) |
-| `retry_delay` | Seconds to wait after Disable / Enable (must be ≥ 0) |
-| `log_file` | Log path (must be non-empty) |
+| `devices[].delay` | Seconds after process start before **automatic** Recover is allowed; omit = 0; `check` **ignores** delay |
+| `devices[].ProblemCode` | Number or array of numbers; Recover only when the device's current ProblemCode is in the set; omit = no extra filter |
+| `retry_delay` | Seconds to wait after Disable / Enable (must be ≥ 0; global) |
 
 If a target is missing at startup, the process logs “device not found” and keeps listening.
 
@@ -485,9 +524,18 @@ Instance ID comparison is **case-insensitive**.
 ```
 Unhealthy (and not Exhausted)
     ↓
+Auto path: devices[].delay not elapsed? → skip, keep listening
+ProblemCode configured and not in set? → skip
+    ↓
 Start Recovery Session (coalesce per device; no concurrent sessions)
     ↓
-Disable → wait retry_delay → Enable → wait → re-check
+If currently enabled → Disable; if already disabled, skip Disable (do not force)
+    ↓
+wait retry_delay
+    ↓
+If currently disabled → Enable; if already enabled, skip Enable (do not force)
+    ↓
+wait → re-check
     ↓
 ┌──────────┴──────────┐
 Success                Still unhealthy
@@ -505,7 +553,8 @@ Reset to Idle          attempt + 1
 
 - Hitting `max_retries` does **not** `os.Exit()` and does **not** stop the global PnP listener
 - Exhausted devices only log on ordinary PnP events; no new automatic session
-- Only `PnP-Device-Recovery.exe check` clears Exhausted and rescans; a new session starts at attempt = 1 if still unhealthy
+- `PnP-Device-Recovery.exe check` clears Exhausted and rescans; it **ignores** `delay` but still applies the ProblemCode filter and Disable/Enable state gates; a new session starts at attempt = 1 if still unhealthy
+- Disabled vs enabled: CfgMgr `CM_PROB_DISABLED` (22); a device may be enabled yet unhealthy (e.g. Code 43)
 
 ---
 
@@ -535,10 +584,13 @@ PnP-Device-Recovery.exe help         Usage (-h / --help also work)
 
 ## Logging
 
+- Controlled by the `log` object; `enabled=false` means no file and no console output
+- `level=debug` adds skip reasons, Ready poll details, etc.
 - Encoding: UTF-8
 - No line-count limit
-- Size cap: `10 * 1024 * 1024` (10 MiB)
+- Size cap: `10 * 1024 * 1024` (10 MiB); when enabled, overwrite when exceeded
 - Before write: if `current_size + line_length` would exceed the cap, truncate then write
+- Default filename: `PnP-Device-Recovery.log` (next to the exe)
 
 Typical fields: time, FriendlyName, Instance ID, Status, ProblemCode, scan reason (`startup` / `pnp_event` / `recovery_postcheck`), trigger event, Recovery attempt, Disable/Enable API results, final outcome.
 
@@ -599,7 +651,7 @@ pnputil /enum-devices /problem
 | Still exits after UAC | Elevation denied |
 | `status` → not running | Daemon not started |
 | No auto recovery after Exhausted | Expected; run `check` |
-| Long delay before first scan | Waiting for session/LogonUI + ~3s minimum buffer |
+| Long delay before first scan | Waiting for input desktop Winlogon/Default (up to ~1 minute) or devices[].delay |
 | Device not found | FriendlyName mismatch; try `regex:` |
 | Log suddenly short | Exceeded 10 MiB; truncated before write |
 | Disable / Enable failed | Check log for `api=… result=CR_xxx` |
@@ -612,7 +664,7 @@ This is one real-world usage example, not the only purpose. Any PnP device that 
 
 A laptop dGPU occasionally entered **Code 43**. After putting its FriendlyName (e.g. `NVIDIA GeForce RTX 3060 Laptop GPU`) in `config.json`, the tool detected the fault on the post-ready initial scan, ran Disable → Enable, observed related GPU / Display PnP arrival/removal events, then saw ProblemCode return to 0 and Recovery succeed.
 
-On some **dGPU-only / MUX** machines, Disable/Enable of the GPU during the Boot screen can blank the display. This tool therefore waits until the lock/logon UI is up (plus ~3s minimum buffer) before the first scan — the same policy helps other devices that are unstable early in boot.
+On some **dGPU-only / MUX** machines, Disable/Enable of the GPU during the Boot screen can blank the display. This tool therefore waits until the input desktop is Winlogon (session Connected/Active) or Default, and you can further defer automatic Recover with `devices[].delay` — the same policy helps other devices that are unstable early in boot.
 
 ---
 

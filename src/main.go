@@ -73,7 +73,7 @@ func runOneShotCheck() int {
 		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
 		return 1
 	}
-	logger, err := NewLogger(cfg.LogFile)
+	logger, err := NewLogger(cfg.Log)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logger error: %v\n", err)
 		return 1
@@ -112,7 +112,7 @@ func runOneShotCheck() int {
 	rm := NewRecoveryManager(cfg, matchers, logger)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rm.Scan(ctx, ScanReason{Reason: "check"})
+	rm.Scan(ctx, ScanReason{Reason: "check", IgnoreDelay: true})
 	rm.Wait()
 	printStatus(&StatusSnapshot{
 		Phase:              "ONE_SHOT",
@@ -130,7 +130,7 @@ func runDaemon() int {
 		return 1
 	}
 
-	logger, err := NewLogger(cfg.LogFile)
+	logger, err := NewLogger(cfg.Log)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "logger error: %v\n", err)
 		return 1

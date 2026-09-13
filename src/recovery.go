@@ -37,11 +37,12 @@ func realDeviceOps() deviceOps {
 // Same device never runs concurrent recoveries (events coalesce).
 // Exhausted devices do not auto-retry on normal PnP events — only check clears.
 type RecoveryManager struct {
-	cfg      *Config
-	matchers []*Matcher
-	logger   *Logger
-	delay    time.Duration
-	ops      deviceOps
+	cfg          *Config
+	matchers     []*Matcher
+	logger       *Logger
+	delay        time.Duration // retry_delay between disable/enable
+	ops          deviceOps
+	processStart time.Time
 
 	mu       sync.Mutex
 	sessions map[string]*deviceSession // key: NormalizeInstanceID
@@ -61,19 +62,26 @@ type deviceSession struct {
 }
 
 // NewRecoveryManager creates a manager for the given config and matchers.
+// processStart is set to now and used for per-device delay gating.
 func NewRecoveryManager(cfg *Config, matchers []*Matcher, logger *Logger) *RecoveryManager {
 	return &RecoveryManager{
-		cfg:      cfg,
-		matchers: matchers,
-		logger:   logger,
-		delay:    time.Duration(cfg.RetryDelay) * time.Second,
-		ops:      realDeviceOps(),
-		sessions: make(map[string]*deviceSession),
+		cfg:          cfg,
+		matchers:     matchers,
+		logger:       logger,
+		delay:        time.Duration(cfg.RetryDelay) * time.Second,
+		ops:          realDeviceOps(),
+		processStart: time.Now(),
+		sessions:     make(map[string]*deviceSession),
 	}
 }
 
 func (rm *RecoveryManager) setOps(ops deviceOps) {
 	rm.ops = ops
+}
+
+// setProcessStartForTest overrides the delay clock (tests only).
+func (rm *RecoveryManager) setProcessStartForTest(t time.Time) {
+	rm.processStart = t
 }
 
 func sessionKey(instanceID, friendlyName string, cfgIdx int) string {
@@ -122,14 +130,17 @@ func (rm *RecoveryManager) ClearExhausted() {
 }
 
 // Scan enumerates devices and starts recovery for unhealthy configured matches.
-// reason=check clears Exhausted first. reason=pnp_event / startup skip Exhausted.
+// reason=check clears Exhausted first and ignores per-device delay.
+// reason=pnp_event / startup skip Exhausted and apply delay.
 func (rm *RecoveryManager) Scan(ctx context.Context, reason ScanReason) {
-	rm.logger.Infof("scan start: reason=%s trigger_instance=%q trigger_action=%q",
-		reason.Reason, reason.TriggerInstance, reason.TriggerAction)
+	rm.logger.Infof("scan start: reason=%s trigger_instance=%q trigger_action=%q ignore_delay=%v",
+		reason.Reason, reason.TriggerInstance, reason.TriggerAction, reason.IgnoreDelay)
 
 	if reason.Reason == "check" {
 		rm.ClearExhausted()
 	}
+
+	ignoreDelay := reason.IgnoreDelay || reason.Reason == "check"
 
 	devices, err := rm.ops.Enumerate()
 	if err != nil {
@@ -153,7 +164,7 @@ func (rm *RecoveryManager) Scan(ctx context.Context, reason ScanReason) {
 					reason.Reason, m.Pattern(), dev.FriendlyName, dev.InstanceID, dev.Status, dev.ProblemCode, dev.IsHealthy())
 			}
 			if !dev.IsHealthy() {
-				rm.HandleDeviceProblem(ctx, dev)
+				rm.HandleDeviceProblem(ctx, dev, ignoreDelay)
 			}
 		}
 		if !found {
@@ -168,7 +179,9 @@ func (rm *RecoveryManager) Scan(ctx context.Context, reason ScanReason) {
 
 // HandleDeviceProblem starts a recovery session if the device matches and is unhealthy.
 // Exhausted devices are skipped (use check). Same device is serial; different devices parallel.
-func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *DeviceInfo) {
+// ignoreDelay=true (IPC/CLI check) skips the per-device delay gate but still applies
+// ProblemCode filter and enable/disable state gates.
+func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *DeviceInfo, ignoreDelay bool) {
 	if info == nil {
 		return
 	}
@@ -180,6 +193,29 @@ func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *Device
 		rm.logger.Infof("device healthy, skip recovery: name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d",
 			info.FriendlyName, info.InstanceID, info.DevInst, info.Status, info.ProblemCode)
 		return
+	}
+
+	// ProblemCode filter (applies to auto and check).
+	if dcfg.HasProblemCodeFilter() && !dcfg.MatchesProblemCode(info.ProblemCode) {
+		rm.logger.Infof("skip Recover: ProblemCode=%d not in configured set %v for %q (instance=%q); keep listening",
+			info.ProblemCode, []uint32(dcfg.ProblemCode), info.FriendlyName, info.InstanceID)
+		rm.logger.Debugf("ProblemCode filter detail: name=%q status=0x%X DN_STARTED=%v disabled=%v",
+			info.FriendlyName, info.Status, info.Status&DN_STARTED != 0, info.IsDisabled())
+		return
+	}
+
+	// Per-device delay since process start (auto only; check ignores).
+	if !ignoreDelay {
+		need := time.Duration(dcfg.DelaySeconds()) * time.Second
+		elapsed := time.Since(rm.processStart)
+		if need > 0 && elapsed < need {
+			remain := need - elapsed
+			rm.logger.Infof("skip Recover: delay not elapsed for %q (delay=%ds elapsed=%.1fs remain=%.1fs); keep listening",
+				info.FriendlyName, dcfg.DelaySeconds(), elapsed.Seconds(), remain.Seconds())
+			rm.logger.Debugf("delay gate detail: instance=%q process_start=%s ignore_delay=%v",
+				info.InstanceID, rm.processStart.Format(time.RFC3339Nano), ignoreDelay)
+			return
+		}
 	}
 
 	key := sessionKey(info.InstanceID, info.FriendlyName, m.Index())
@@ -233,6 +269,23 @@ func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *Device
 	}()
 }
 
+func (rm *RecoveryManager) refreshDevice(info *DeviceInfo) *DeviceInfo {
+	if info == nil {
+		return nil
+	}
+	if info.InstanceID != "" {
+		if cur, err := rm.ops.GetByInstanceID(info.InstanceID); err == nil && cur != nil {
+			return cur
+		}
+	}
+	if info.FriendlyName != "" {
+		if cur, err := rm.ops.FindByFriendlyName(info.FriendlyName); err == nil && cur != nil {
+			return cur
+		}
+	}
+	return info
+}
+
 func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, key string, initial *DeviceInfo, dcfg *DeviceConfig, m *Matcher) {
 	rm.logger.Infof("recovery session start: name=%q pattern=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d max_retries=%d",
 		initial.FriendlyName, m.Pattern(), initial.InstanceID, initial.DevInst, initial.Status, initial.ProblemCode, dcfg.MaxRetries)
@@ -263,15 +316,12 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 
 		rm.logger.Infof("recovery attempt %d/%d for %q (%s)", attempt, maxR, initial.FriendlyName, key)
 
-		info := initial
-		if initial.InstanceID != "" {
-			if cur, err := rm.ops.GetByInstanceID(initial.InstanceID); err == nil && cur != nil {
-				if cur.DevInst != 0 {
-					rm.logger.Infof("resolved_DEVINST=%d instance=%q (after LocateDevNode)", cur.DevInst, cur.InstanceID)
-				} else {
-					rm.logger.Infof("event_devinst_unset after GetDeviceByInstanceID instance=%q", cur.InstanceID)
-				}
-				info = cur
+		info := rm.refreshDevice(initial)
+		if info.InstanceID != "" {
+			if info.DevInst != 0 {
+				rm.logger.Infof("resolved_DEVINST=%d instance=%q (after LocateDevNode)", info.DevInst, info.InstanceID)
+			} else {
+				rm.logger.Infof("event_devinst_unset after GetDeviceByInstanceID instance=%q", info.InstanceID)
 			}
 		}
 
@@ -285,11 +335,30 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 			return
 		}
 
-		rm.logger.Infof("disable device: name=%q instance=%q resolved_DEVINST=%d", info.FriendlyName, info.InstanceID, info.DevInst)
-		if err := rm.ops.Disable(info); err != nil {
-			rm.logger.Errorf("disable failed for %q (%s): %v", info.FriendlyName, key, err)
+		// Re-apply ProblemCode filter on refreshed state (device may have changed).
+		if dcfg.HasProblemCodeFilter() && !dcfg.MatchesProblemCode(info.ProblemCode) {
+			rm.logger.Infof("skip Recover mid-session: ProblemCode=%d not in set %v for %q; ending session without Exhausted",
+				info.ProblemCode, []uint32(dcfg.ProblemCode), info.FriendlyName)
+			sess.mu.Lock()
+			sess.attempts = 0
+			sess.state = StateIdle
+			sess.mu.Unlock()
+			return
+		}
+
+		// Before Disable: must be ENABLED; if already disabled, skip Disable.
+		info = rm.refreshDevice(info)
+		if info.IsDisabled() {
+			rm.logger.Infof("skip Disable: device already disabled (ProblemCode=%d status=0x%X DN_STARTED=%v) name=%q instance=%q",
+				info.ProblemCode, info.Status, info.Status&DN_STARTED != 0, info.FriendlyName, info.InstanceID)
 		} else {
-			rm.logger.Infof("disable OK for %q (%s)", info.FriendlyName, key)
+			rm.logger.Infof("disable device: name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d",
+				info.FriendlyName, info.InstanceID, info.DevInst, info.Status, info.ProblemCode)
+			if err := rm.ops.Disable(info); err != nil {
+				rm.logger.Errorf("disable failed for %q (%s): %v", info.FriendlyName, key, err)
+			} else {
+				rm.logger.Infof("disable OK for %q (%s)", info.FriendlyName, key)
+			}
 		}
 
 		if !sleepOrDone(ctx, rm.delay) {
@@ -297,11 +366,19 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 			return
 		}
 
-		rm.logger.Infof("enable device: name=%q instance=%q resolved_DEVINST=%d", info.FriendlyName, info.InstanceID, info.DevInst)
-		if err := rm.ops.Enable(info); err != nil {
-			rm.logger.Errorf("enable failed for %q (%s): %v", info.FriendlyName, key, err)
+		// Before Enable: must be DISABLED; if already enabled, skip Enable.
+		info = rm.refreshDevice(info)
+		if !info.IsDisabled() {
+			rm.logger.Infof("skip Enable: device not disabled (ProblemCode=%d status=0x%X DN_STARTED=%v) name=%q instance=%q; will not force",
+				info.ProblemCode, info.Status, info.Status&DN_STARTED != 0, info.FriendlyName, info.InstanceID)
 		} else {
-			rm.logger.Infof("enable OK for %q (%s)", info.FriendlyName, key)
+			rm.logger.Infof("enable device: name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d",
+				info.FriendlyName, info.InstanceID, info.DevInst, info.Status, info.ProblemCode)
+			if err := rm.ops.Enable(info); err != nil {
+				rm.logger.Errorf("enable failed for %q (%s): %v", info.FriendlyName, key, err)
+			} else {
+				rm.logger.Infof("enable OK for %q (%s)", info.FriendlyName, key)
+			}
 		}
 
 		if !sleepOrDone(ctx, rm.delay) {
@@ -309,20 +386,9 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 			return
 		}
 
-		post := info
-		if info.InstanceID != "" {
-			if cur, err := rm.ops.GetByInstanceID(info.InstanceID); err == nil && cur != nil {
-				if cur.DevInst != 0 {
-					rm.logger.Infof("resolved_DEVINST=%d instance=%q (post-recovery recheck)", cur.DevInst, cur.InstanceID)
-				}
-				post = cur
-			} else if err != nil {
-				rm.logger.Warnf("recheck GetDeviceByInstanceID failed for %s: %v", info.InstanceID, err)
-			}
-		} else {
-			if cur, err := rm.ops.FindByFriendlyName(info.FriendlyName); err == nil && cur != nil {
-				post = cur
-			}
+		post := rm.refreshDevice(info)
+		if post.InstanceID != "" && post.DevInst != 0 {
+			rm.logger.Infof("resolved_DEVINST=%d instance=%q (post-recovery recheck)", post.DevInst, post.InstanceID)
 		}
 
 		rm.logger.Infof("scan/recheck: reason=recovery_postcheck name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d healthy=%v",
