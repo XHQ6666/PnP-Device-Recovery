@@ -12,17 +12,20 @@ import (
 )
 
 // Internal constants — not part of config.json.
+// Ready = console session up + lock/logon UI (LogonUI), then a short fixed buffer.
 const (
-	readyPollInterval  = 1 * time.Second
-	readySafetyBuffer  = 12 * time.Second
-	readyExplorerGrace = 30 * time.Second
-	readyMaxWait       = 8 * time.Minute
+	readyPollInterval = 500 * time.Millisecond
+	readyPostReadyMin = 3 * time.Second  // minimum wait after lock-screen ready before Initial Scan
+	readyLogonUIGrace = 5 * time.Second  // if session is up but LogonUI never appears (e.g. auto-logon)
+	readyMaxWait      = 1 * time.Minute
 )
 
+// WTS_CONNECTSTATE_CLASS
 const (
 	wtsCurrentServerHandle = 0
-	wtsConnectState        = 8
-	wtsActive              = 0
+	wtsConnectState        = 8 // WTSConnectState
+	wtsActive              = 0 // WTSActive
+	wtsConnected           = 1 // WTSConnected
 	invalidSessionID       = 0xFFFFFFFF
 )
 
@@ -65,7 +68,11 @@ func querySessionState(sessionID uint32) (uint32, bool) {
 	return state, true
 }
 
-func explorerPresent() bool {
+func sessionStateReady(state uint32) bool {
+	return state == wtsActive || state == wtsConnected
+}
+
+func processPresent(exeName string) bool {
 	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if err != nil {
 		return false
@@ -78,7 +85,7 @@ func explorerPresent() bool {
 	}
 	for {
 		name := windows.UTF16ToString(entry.ExeFile[:])
-		if strings.EqualFold(name, "explorer.exe") {
+		if strings.EqualFold(name, exeName) {
 			return true
 		}
 		if err := windows.Process32Next(snap, &entry); err != nil {
@@ -88,12 +95,17 @@ func explorerPresent() bool {
 	return false
 }
 
-// WaitForSystemReady waits for a WTSActive interactive session, treats
-// explorer.exe as a soft signal, then applies a short hardcoded safety buffer.
+func logonUIPresent() bool {
+	return processPresent("LogonUI.exe")
+}
+
+// WaitForSystemReady waits until the console session is Connected/Active and the
+// lock/logon UI is likely up (LogonUI.exe), then applies a minimum post-ready
+// buffer (3s) before Initial Scan. It does not wait for explorer/desktop.
 // After readyMaxWait it proceeds with a warning instead of hanging forever.
 func WaitForSystemReady(ctx context.Context, logger *Logger) error {
 	if logger != nil {
-		logger.Infof("WAIT_FOR_SYSTEM_READY: waiting for interactive WTSActive session")
+		logger.Infof("WAIT_FOR_SYSTEM_READY: waiting for console session Connected/Active and LogonUI (lock screen)")
 	}
 	deadline := time.Now().Add(readyMaxWait)
 	var sessionReadyAt time.Time
@@ -105,23 +117,23 @@ func WaitForSystemReady(ctx context.Context, logger *Logger) error {
 		}
 		sid := activeConsoleSessionID()
 		state, ok := querySessionState(sid)
-		if sid != invalidSessionID && ok && state == wtsActive {
+		if sid != invalidSessionID && ok && sessionStateReady(state) {
 			if !sessionReady {
 				sessionReady = true
 				sessionReadyAt = time.Now()
 				if logger != nil {
-					logger.Infof("interactive session active: session_id=%d state=WTSActive", sid)
+					logger.Infof("console session ready: session_id=%d state=%d (0=Active 1=Connected)", sid, state)
 				}
 			}
-			if explorerPresent() {
+			if logonUIPresent() {
 				if logger != nil {
-					logger.Infof("soft signal: explorer.exe present")
+					logger.Infof("soft signal: LogonUI.exe present (lock/logon UI)")
 				}
 				break
 			}
-			if time.Since(sessionReadyAt) >= readyExplorerGrace {
+			if time.Since(sessionReadyAt) >= readyLogonUIGrace {
 				if logger != nil {
-					logger.Warnf("explorer.exe not found after %s; proceeding on WTSActive only", readyExplorerGrace)
+					logger.Warnf("LogonUI.exe not found after %s; proceeding on session state only (e.g. auto-logon)", readyLogonUIGrace)
 				}
 				break
 			}
@@ -129,6 +141,10 @@ func WaitForSystemReady(ctx context.Context, logger *Logger) error {
 		if time.Now().After(deadline) {
 			if logger != nil {
 				logger.Warnf("WAIT_FOR_SYSTEM_READY timed out after %s; proceeding with warning", readyMaxWait)
+			}
+			// Still apply the minimum post-ready buffer when possible.
+			if !sleepOrDone(ctx, readyPostReadyMin) {
+				return ctx.Err()
 			}
 			return nil
 		}
@@ -138,9 +154,9 @@ func WaitForSystemReady(ctx context.Context, logger *Logger) error {
 	}
 
 	if logger != nil {
-		logger.Infof("applying post-session safety buffer %s", readySafetyBuffer)
+		logger.Infof("lock-screen ready: applying minimum post-ready buffer %s before Initial Scan", readyPostReadyMin)
 	}
-	if !sleepOrDone(ctx, readySafetyBuffer) {
+	if !sleepOrDone(ctx, readyPostReadyMin) {
 		return ctx.Err()
 	}
 	return nil

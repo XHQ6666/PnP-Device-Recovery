@@ -68,7 +68,7 @@ PnP Event（事件驱动，非固定轮询）
 
 ## 启动时序
 
-守护进程不会在进程一启动就对设备执行 Disable / Enable。启动阶段 Windows 仍在完成会话与设备栈初始化，过早操作可能带来不稳定。
+守护进程不会在进程一启动就对设备执行 Disable / Enable。过早操作（例如仍在 Boot 画面）可能不稳定。Ready 点取 **锁屏 / 登录 UI**，不必等到用户解锁进桌面。
 
 ```
 进程启动
@@ -84,10 +84,11 @@ STARTING
   │
   ▼
 WAIT_FOR_SYSTEM_READY
-  │  等待交互式用户会话就绪（WTSActive 等）
-  │  辅以 Shell 进程等软信号
-  │  再加一段内部安全缓冲
-  │  （超时后带警告继续，避免永久挂起）
+  │  控制台会话 Connected / Active
+  │  LogonUI.exe（锁屏/登录 UI）软信号
+  │  若无 LogonUI（如自动登录）：会话就绪后再宽限约 5s
+  │  然后固定再等约 3s（内部最小值）
+  │  （总超时约 1 分钟；超时后带警告继续，避免永久挂起）
   │
   ▼
 INITIAL_SCAN（reason=startup）
@@ -98,7 +99,7 @@ NORMAL_RUNNING
      事件驱动 + 尾沿合并
 ```
 
-就绪等待、安全缓冲、防抖间隔均为 **内部常量**，不会出现在 `config.json` 中。
+不等待 `explorer.exe` / 完整桌面。就绪等待与 3 秒缓冲均为 **内部常量**，不会出现在 `config.json` 中。
 
 ---
 
@@ -110,7 +111,7 @@ NORMAL_RUNNING
 - **多设备**：独立会话、独立重试计数；不同设备可并行，同一设备串行
 - **尾沿事件合并**：短时间内连续 PnP 事件合并为一次扫描，减轻枚举风暴
 - **Exhausted 状态**：达到 `max_retries` 后该设备停止自动恢复；仅 `check` 可清除并重试
-- **启动延迟扫描**：系统稳定后再做首次扫描
+- **启动延迟扫描**：到锁屏/登录 UI 后再做首次扫描（另有约 3s 内部最小缓冲）
 - **单实例 + 本地命名管道 IPC**
 - **UAC 自动提权**
 - **UTF-8 日志**，上限 10 MiB，超出后覆盖旧内容
@@ -275,7 +276,7 @@ pnputil /enum-devices /problem
 | UAC 后仍退出 | 用户拒绝提升权限 |
 | `status` 显示 not running | 守护进程未启动 |
 | Exhausted 后不再自动恢复 | 预期行为；运行 `check` |
-| 启动后较久才第一次扫描 | 正在等待会话就绪与内部安全缓冲 |
+| 启动后较久才第一次扫描 | 正在等待会话/LogonUI 与约 3s 最小缓冲 |
 | 找不到设备 | FriendlyName 与设备管理器不一致；可改用 `regex:` |
 | 日志突然变短 | 已超过 10 MiB，写入前截断覆盖 |
 | Disable / Enable 失败 | 查看日志中的 `api=… result=CR_xxx` |
@@ -288,7 +289,7 @@ pnputil /enum-devices /problem
 
 某笔记本独显偶发进入 **Code 43**。将 FriendlyName（例如 `NVIDIA GeForce RTX 3060 Laptop GPU`）写入 `config.json` 后，程序在系统就绪并完成初始扫描时检测到异常，执行 Disable → Enable；随后可见相关 GPU / Display 等 PnP 到达与移除事件，复查后 ProblemCode 回到 0，Recovery 成功。
 
-在 **dGPU-only / MUX** 等机器上，若在 Windows 刚启动、显示栈尚未稳定时就对 GPU 做 Disable/Enable，可能造成显示输出异常甚至黑屏。这也是本工具坚持「先等系统就绪，再做首次扫描」的重要原因之一；该策略对其他在启动早期尚不稳定的设备同样适用。
+在 **dGPU-only / MUX** 等机器上，若在 Boot 画面阶段就对 GPU 做 Disable/Enable，可能造成显示输出异常甚至黑屏。本工具因此等到锁屏/登录 UI 后再做首次扫描（并加约 3s 最小缓冲）；该策略对其他在启动早期尚不稳定的设备同样适用。
 
 ---
 
@@ -390,7 +391,7 @@ Anything else is treated as unhealthy (including but not limited to Codes 10 / 3
 
 ## Startup sequence
 
-The daemon does **not** Disable/Enable devices immediately at process start. During early boot, Windows is still bringing up the user session and device stacks; operating too early can be unstable.
+The daemon does **not** Disable/Enable devices immediately at process start. Ready means **lock / logon UI**, not a fully loaded desktop after unlock.
 
 ```
 Process start
@@ -406,10 +407,11 @@ STARTING
   │
   ▼
 WAIT_FOR_SYSTEM_READY
-  │  Wait for an interactive session (e.g. WTSActive)
-  │  Soft signals such as Shell process presence
-  │  Internal safety buffer
-  │  (timeout continues with a warning — no infinite hang)
+  │  Console session Connected / Active
+  │  LogonUI.exe soft signal (lock/logon UI)
+  │  If no LogonUI (e.g. auto-logon): ~5s grace after session ready
+  │  Then a fixed ~3s minimum buffer
+  │  (overall timeout ~1 minute; then continue with a warning — no infinite hang)
   │
   ▼
 INITIAL_SCAN (reason=startup)
@@ -420,7 +422,7 @@ NORMAL_RUNNING
      Event-driven + trailing-edge coalescing
 ```
 
-Ready-wait, safety buffer, and debounce intervals are **internal constants** and are **not** part of `config.json`.
+It does **not** wait for `explorer.exe` / full desktop. Ready-wait and the 3s buffer are **internal constants**, not `config.json` fields.
 
 ---
 
@@ -432,7 +434,7 @@ Ready-wait, safety buffer, and debounce intervals are **internal constants** and
 - **Multi-device**: independent sessions and counters; parallel across devices, serial per device
 - **Trailing-edge coalescing**: bursts of PnP events collapse into one scan
 - **Exhausted state**: after `max_retries`, no more automatic recovery until `check`
-- **Deferred initial scan** after the system is ready
+- **Deferred initial scan** after lock/logon UI is ready (plus ~3s internal minimum buffer)
 - **Single instance + local named-pipe IPC**
 - **UAC auto-elevation**
 - **UTF-8 log**, max **10 MiB**, overwrite when exceeded
@@ -597,7 +599,7 @@ pnputil /enum-devices /problem
 | Still exits after UAC | Elevation denied |
 | `status` → not running | Daemon not started |
 | No auto recovery after Exhausted | Expected; run `check` |
-| Long delay before first scan | Waiting for session ready + internal buffer |
+| Long delay before first scan | Waiting for session/LogonUI + ~3s minimum buffer |
 | Device not found | FriendlyName mismatch; try `regex:` |
 | Log suddenly short | Exceeded 10 MiB; truncated before write |
 | Disable / Enable failed | Check log for `api=… result=CR_xxx` |
@@ -610,7 +612,7 @@ This is one real-world usage example, not the only purpose. Any PnP device that 
 
 A laptop dGPU occasionally entered **Code 43**. After putting its FriendlyName (e.g. `NVIDIA GeForce RTX 3060 Laptop GPU`) in `config.json`, the tool detected the fault on the post-ready initial scan, ran Disable → Enable, observed related GPU / Display PnP arrival/removal events, then saw ProblemCode return to 0 and Recovery succeed.
 
-On some **dGPU-only / MUX** machines, Disable/Enable of the GPU before the display stack is stable can blank the screen. That is one reason this tool waits for system readiness before the first scan — the same policy helps other devices that are unstable early in boot.
+On some **dGPU-only / MUX** machines, Disable/Enable of the GPU during the Boot screen can blank the display. This tool therefore waits until the lock/logon UI is up (plus ~3s minimum buffer) before the first scan — the same policy helps other devices that are unstable early in boot.
 
 ---
 
