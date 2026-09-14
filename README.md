@@ -22,7 +22,7 @@
 | 设备偶发异常 | 设备仍在系统中枚举，但带有 Problem Code，功能不可用 |
 | 需要自动软复位 | 手工在设备管理器中「禁用 → 启用」往往有效，希望无人值守自动完成 |
 | 多设备并行监控 | 可同时监控多块不同设备，各自独立重试与状态 |
-| 开机计划任务 | 可作为开机启动项运行；Ready（Winlogon/Default）后再首次扫描，并可按设备配置 delay |
+| 开机计划任务 | 可作为开机启动项运行；Ready（系统 uptime ≥ 1s）后再首次扫描，并可按设备配置 delay |
 
 ---
 
@@ -68,7 +68,7 @@ PnP Event（事件驱动，非固定轮询）
 
 ## 启动时序
 
-守护进程不会在进程一启动就对设备执行 Disable / Enable。过早操作（例如仍在 Boot 画面）可能不稳定。Ready 判定基于 **输入桌面名称**（不必等到用户解锁进桌面）。
+守护进程不会在进程一启动就对设备执行 Disable / Enable。过早操作（例如仍在 Boot 画面）可能不稳定。Ready 判定为 **系统已开机计时（uptime）≥ 1 秒**（内部常量；不进 config）。
 
 ```
 进程启动
@@ -84,11 +84,9 @@ STARTING
   │
   ▼
 WAIT_FOR_SYSTEM_READY
-  │  OpenInputDesktop + UOI_NAME：
-  │    - 输入桌面为 "Winlogon" 且控制台会话 Connected/Active（锁屏可交互）
-  │    - 或输入桌面为 "Default"（自动登录 / 桌面）
+  │  GetTickCount64：系统 uptime ≥ 1s 即视为启动完成
   │  （内部轮询；总超时约 1 分钟；超时后带警告继续，避免永久挂起）
-  │  不再使用 LogonUI.exe / 开机时长作为就绪条件
+  │  不再使用 LogonUI / 输入桌面名 / explorer
   │
   ▼
 INITIAL_SCAN（reason=startup）
@@ -99,7 +97,7 @@ NORMAL_RUNNING
      事件驱动 + 尾沿合并
 ```
 
-不等待 `explorer.exe`。就绪轮询间隔与总超时为 **内部常量**，不会出现在 `config.json` 中。额外的每设备自动恢复延迟请用 `devices[].delay`。
+真正推迟自动 Recover 请用 `devices[].delay` / `ProblemCode`。Ready 的 1s uptime 与总超时为 **内部常量**，不进 `config.json`。
 
 ---
 
@@ -111,7 +109,7 @@ NORMAL_RUNNING
 - **多设备**：独立会话、独立重试计数；不同设备可并行，同一设备串行
 - **尾沿事件合并**：短时间内连续 PnP 事件合并为一次扫描，减轻枚举风暴
 - **Exhausted 状态**：达到 `max_retries` 后该设备停止自动恢复；仅 `check` 可清除并重试
-- **Ready 后再首次扫描**：输入桌面 Winlogon（会话就绪）或 Default
+- **Ready 后再首次扫描**：系统 uptime ≥ 1s
 - **每设备 delay / ProblemCode**：自动 Recover 可延后；可按问题代码过滤
 - **Disable/Enable 状态门闩**：仅在设备当前为启用时 Disable，仅在已禁用时 Enable
 - **单实例 + 本地命名管道 IPC**
@@ -302,7 +300,7 @@ pnputil /enum-devices /problem
 | UAC 后仍退出 | 用户拒绝提升权限 |
 | `status` 显示 not running | 守护进程未启动 |
 | Exhausted 后不再自动恢复 | 预期行为；运行 `check` |
-| 启动后较久才第一次扫描 | 正在等待输入桌面 Winlogon/Default（最长约 1 分钟）或 `devices[].delay` |
+| 启动后较久才第一次扫描 | 正在等待 uptime ≥ 1s 或 `devices[].delay` |
 | 找不到设备 | FriendlyName 与设备管理器不一致；可改用 `regex:` |
 | 日志突然变短 | 已超过 10 MiB，写入前截断覆盖 |
 | Disable / Enable 失败 | 查看日志中的 `api=… result=CR_xxx` |
@@ -313,9 +311,9 @@ pnputil /enum-devices /problem
 
 以下为真实环境中的一种用法示例，并非程序唯一用途。任意可通过 FriendlyName 匹配、且 Disable/Enable 有效的 PnP 设备均可纳入配置。
 
-某笔记本独显偶发进入 **Code 43**。将 FriendlyName（例如 `NVIDIA GeForce RTX 3060 Laptop GPU`）写入 `config.json` 后，程序在系统就绪并完成初始扫描时检测到异常，执行 Disable → Enable；随后可见相关 GPU / Display 等 PnP 到达与移除事件，复查后 ProblemCode 回到 0，Recovery 成功。
+某笔记本**内置显示器损坏**后，独显报 **Code 43**，外接显示器也无法正常使用。将 FriendlyName（例如 `NVIDIA GeForce RTX 3060 Laptop GPU`）写入 `config.json`，并配置 `ProblemCode: [43]` 与合适的 `delay` 后，程序在 Ready 与延时条件满足后检测到该状态，执行 Disable → Enable；随后可见相关 GPU / Display 等 PnP 到达与移除事件，复查后 ProblemCode 回到 0，外接输出恢复可用。
 
-在 **dGPU-only / MUX** 等机器上，若在 Boot 画面阶段就对 GPU 做 Disable/Enable，可能造成显示输出异常甚至黑屏。本工具因此等到输入桌面为 Winlogon（会话 Connected/Active）或 Default，并可配合 `devices[].delay` 再延后自动 Recover；该策略对其他在启动早期尚不稳定的设备同样适用。
+在 **dGPU-only / MUX** 等机器上，若在 Boot 画面阶段就对 GPU 做 Disable/Enable，可能造成显示输出异常甚至黑屏。本工具以系统 uptime ≥ 1s 作为 Ready，并建议用 `devices[].delay` / `ProblemCode` 进一步推迟与过滤自动 Recover。
 
 ---
 
@@ -417,7 +415,7 @@ Anything else is treated as unhealthy (including but not limited to Codes 10 / 3
 
 ## Startup sequence
 
-The daemon does **not** Disable/Enable devices immediately at process start. Ready is based on the **input desktop name** (you do not need a fully unlocked desktop).
+The daemon does **not** Disable/Enable devices immediately at process start. Ready means **system uptime ≥ 1 second** (internal constant; not in config).
 
 ```
 Process start
@@ -433,11 +431,9 @@ STARTING
   │
   ▼
 WAIT_FOR_SYSTEM_READY
-  │  OpenInputDesktop + UOI_NAME:
-  │    - input desktop "Winlogon" AND console session Connected/Active (interactive lock)
-  │    - OR input desktop "Default" (auto-logon / desktop)
+  │  GetTickCount64: uptime ≥ 1s counts as boot-complete for this gate
   │  (internal poll; overall timeout ~1 minute; then continue with a warning — no infinite hang)
-  │  LogonUI.exe / uptime are NOT used
+  │  LogonUI / input-desktop name / explorer are NOT used
   │
   ▼
 INITIAL_SCAN (reason=startup)
@@ -448,7 +444,7 @@ NORMAL_RUNNING
      Event-driven + trailing-edge coalescing
 ```
 
-It does **not** wait for `explorer.exe`. Ready poll interval and max wait are **internal constants**, not `config.json` fields. Use `devices[].delay` for an extra per-device automatic-recover delay.
+Defer automatic Recover with `devices[].delay` / `ProblemCode`. The 1s uptime gate and max wait are **internal constants**, not `config.json` fields.
 
 ---
 
@@ -460,7 +456,7 @@ It does **not** wait for `explorer.exe`. Ready poll interval and max wait are **
 - **Multi-device**: independent sessions and counters; parallel across devices, serial per device
 - **Trailing-edge coalescing**: bursts of PnP events collapse into one scan
 - **Exhausted state**: after `max_retries`, no more automatic recovery until `check`
-- **Ready before first scan**: input desktop Winlogon (session ready) or Default
+- **Ready before first scan**: system uptime ≥ 1s
 - **Per-device delay / ProblemCode**: defer automatic Recover; filter by problem codes
 - **Disable/Enable state gates**: Disable only when enabled; Enable only when disabled
 - **Single instance + local named-pipe IPC**
@@ -651,7 +647,7 @@ pnputil /enum-devices /problem
 | Still exits after UAC | Elevation denied |
 | `status` → not running | Daemon not started |
 | No auto recovery after Exhausted | Expected; run `check` |
-| Long delay before first scan | Waiting for input desktop Winlogon/Default (up to ~1 minute) or devices[].delay |
+| Long delay before first scan | Waiting for uptime ≥ 1s or devices[].delay |
 | Device not found | FriendlyName mismatch; try `regex:` |
 | Log suddenly short | Exceeded 10 MiB; truncated before write |
 | Disable / Enable failed | Check log for `api=… result=CR_xxx` |
@@ -662,9 +658,9 @@ pnputil /enum-devices /problem
 
 This is one real-world usage example, not the only purpose. Any PnP device that matches by FriendlyName and benefits from Disable/Enable can be configured.
 
-A laptop dGPU occasionally entered **Code 43**. After putting its FriendlyName (e.g. `NVIDIA GeForce RTX 3060 Laptop GPU`) in `config.json`, the tool detected the fault on the post-ready initial scan, ran Disable → Enable, observed related GPU / Display PnP arrival/removal events, then saw ProblemCode return to 0 and Recovery succeed.
+After a laptop **built-in panel failed**, the discrete GPU reported **Code 43** and the **external display was also unusable**. With its FriendlyName (e.g. `NVIDIA GeForce RTX 3060 Laptop GPU`) in `config.json`, plus `ProblemCode: [43]` and an appropriate `delay`, the tool detected that state after Ready/delay, ran Disable → Enable, observed related GPU / Display PnP arrival/removal events, then saw ProblemCode return to 0 and external output become usable again.
 
-On some **dGPU-only / MUX** machines, Disable/Enable of the GPU during the Boot screen can blank the display. This tool therefore waits until the input desktop is Winlogon (session Connected/Active) or Default, and you can further defer automatic Recover with `devices[].delay` — the same policy helps other devices that are unstable early in boot.
+On some **dGPU-only / MUX** machines, Disable/Enable of the GPU during the Boot screen can blank the display. This tool uses system uptime ≥ 1s as Ready; further gate automatic Recover with `devices[].delay` / `ProblemCode`.
 
 ---
 
