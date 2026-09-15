@@ -154,26 +154,70 @@ NORMAL_RUNNING
 | `devices[].max_retries` | 单次 Recovery Session 的最大尝试次数（必须 > 0） |
 | `devices[].rec_delay` | 自动 Recover 前额外等待（**默认关**）。裸数字 `N` ≡ `{"based":"uptime","sec":N}`；对象须同时含 `based`（`uptime`\|`daemon`\|`device`）与 `sec`；**省略或 0** 则关闭不等。`check` 忽略。 |
 | `devices[].ProblemCode` | 单个数字或数字数组；仅当设备当前 ProblemCode 落在集合内才 Recover；省略 = 不额外过滤 |
-| `advanced` | **可选**对象；省略对象或字段时使用代码默认值（见下表） |
-#### `advanced`（均可选）
+| `advanced` | **可选**对象；省略整个对象或其中字段时使用代码默认值（见「高级参数」） |
+
+### Deprecated / 已移除字段与迁移（≥ v1.2）
+
+自 **v1.2.0** 起下列字段 **已删除且无兼容映射**：JSON 仍可能解析通过，但旧键会被 **静默忽略、不再生效**。旧版（≤ v1.1.x）请先按表改写再升级。
+
+| 旧字段 | 状态 | 迁移到 |
+|--------|------|--------|
+| `log_file` | 已移除（更早版本） | `log.path`（`log` 对象必填） |
+| `devices[].delay` | **已移除** | `devices[].rec_delay` |
+| `retry_delay`（顶层） | **已移除** | **不要**再配置。Disable→Enable 间隔改为代码内固定 **3 秒**；失败尝试间隔改为 `advanced.retry_interval`（默认 3） |
+
+**`delay` → `rec_delay` 对照**
+
+| 旧写法 | 新写法 | 含义 |
+|--------|--------|------|
+| 省略 `delay` | 省略 `rec_delay` 或 `"rec_delay": 0` | 不等待（默认关） |
+| `"delay": 60` | `"rec_delay": 60` | 等价于 `{ "based": "uptime", "sec": 60 }`：系统 uptime ≥ 60s 才允许自动 Recover |
+| （无对象形式） | `"rec_delay": { "based": "daemon", "sec": 30 }` | 本进程启动后满 30s |
+| （无对象形式） | `"rec_delay": { "based": "device", "sec": 15 }` | 本会话首次匹配该设备后满 15s |
+| `"retry_delay": 2` | 删除该键；需要时可设 `"advanced": { "retry_interval": 3 }` | 旧值曾用于 Disable/Enable **之后**等待；新语义拆开：Disable→Enable 固定 3s；失败重试间隔用 `retry_interval` |
+
+`rec_delay` 时钟：
+- `uptime`：`GetTickCount64` 开机以来
+- `daemon`：本进程启动以来
+- `device`：本会话中该设备首次被 Scan/Handle 匹配的时间（短暂消失不重置）
+
+**硬编码（不可配置）**：Disable 与 Enable **之间**固定等待 **3 秒**；若跳过 Disable 则不等待；Enable 后复查前 **无**固定等待。
+
+### 高级参数 `advanced`
+
+日常可省略整个 `advanced`。仅在需要微调 Ready / 重试节奏 / 日志体积 / PnP 合并时再写。所有字段均可单独省略，省略则用默认值。
+
+示例（按需裁剪字段）：
+
+```json
+{
+  "log": { "enabled": true, "level": "normal", "path": "" },
+  "devices": [
+    { "friendly_name": "Example Device Name", "max_retries": 10, "rec_delay": 10, "ProblemCode": [43] }
+  ],
+  "advanced": {
+    "retry_interval": 3,
+    "ready_min_uptime_sec": 1,
+    "ready_poll_ms": 200,
+    "ready_max_wait_sec": 60,
+    "pnp_debounce_ms": 500,
+    "log_max_bytes": 10485760,
+    "pnp_register_wait_sec": 3,
+    "uptime_bypass": 60
+  }
+}
+```
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
-| `retry_interval` | 3 | 失败 Recover **尝试**之间的间隔秒数（不是 Disable→Enable 间隔） |
-| `ready_min_uptime_sec` | 1 | Ready：系统 uptime 至少秒数 |
-| `ready_poll_ms` | 200 | Ready 轮询间隔（毫秒） |
-| `ready_max_wait_sec` | 60 | Ready 最长等待秒数 |
-| `pnp_debounce_ms` | 500 | PnP 尾沿合并间隔（毫秒） |
-| `log_max_bytes` | 10485760 | 日志轮转阈值（10 MiB） |
-| `pnp_register_wait_sec` | 3 | 等待 PnP 注册完成的秒数 |
-| `uptime_bypass` | 60 | 当 `rec_delay.based=uptime`（含裸数字）且当前 uptime ≥ 此值时，**忽略 sec** 立即允许 Recover；`0` = 关闭旁路 |
-
-**Disable→Enable** 之间固定等待 **3 秒**（硬编码，不进配置）；Enable 后复查不再固定等待。`retry_interval` 仅用于失败尝试之间。
-
-`rec_delay` 时钟：
-- `uptime`：`GetTickCount64` 开机以来毫秒
-- `daemon`：本进程启动以来
-- `device`：本会话中该设备首次被 Scan/Handle 匹配的时间（短暂消失不重置）
+| `retry_interval` | `3` | 一次 Recover **尝试失败后**，到下一次尝试前的等待秒数。**不是** Disable→Enable 间隔。须 ≥ 0。 |
+| `ready_min_uptime_sec` | `1` | Ready 条件：系统 uptime 至少达到该秒数后才允许首次扫描 / 自动 Recover 入口。须 ≥ 0。 |
+| `ready_poll_ms` | `200` | Ready 阶段轮询间隔（毫秒）。须 > 0。 |
+| `ready_max_wait_sec` | `60` | Ready 最长等待秒数；超时后按实现继续（仍会记日志）。须 ≥ 0。 |
+| `pnp_debounce_ms` | `500` | PnP 事件尾沿合并窗口（毫秒）：窗口内连续事件合并为一次扫描。须 ≥ 0。 |
+| `log_max_bytes` | `10485760`（10 MiB） | 单日志文件超过该大小时，写入前截断覆盖。须 > 0。 |
+| `pnp_register_wait_sec` | `3` | 启动时等待 PnP 通知注册完成的秒数。须 ≥ 0。 |
+| `uptime_bypass` | `60` | 仅当 `rec_delay.based` 为 `uptime`（含裸数字形式）时生效：若当前系统 uptime ≥ 该值，则 **忽略** `rec_delay.sec`，立即允许自动 Recover。设为 `0` 关闭旁路。守护进程开得晚、uptime 已经很大时避免再空等 `sec`。须 ≥ 0。 |
 
 启动时若目标设备尚未枚举：记录「device not found」并继续监听，待后续 PnP 事件再处理。
 
@@ -519,26 +563,70 @@ Place `config.json` next to the executable. The `log` object is **required**. Re
 | `devices[].max_retries` | Max attempts per Recovery Session (must be > 0) |
 | `devices[].rec_delay` | Extra wait before **automatic** Recover (**off by default**). Bare number `N` ≡ `{"based":"uptime","sec":N}`; object requires `based` (`uptime`\|`daemon`\|`device`) and `sec`; **omit or 0** disables. Ignored by `check`. |
 | `devices[].ProblemCode` | Number or array of numbers; Recover only when the device's current ProblemCode is in the set; omit = no extra filter |
-| `advanced` | **Optional** object; omit object or field → code defaults (see table below) |
-#### `advanced` (all optional)
+| `advanced` | **Optional** object; omit the whole object or any field → code defaults (see **Advanced settings**) |
 
-| Field | Default | Meaning |
-|-------|---------|---------|
-| `retry_interval` | 3 | Seconds between failed Recover **attempts** (not the Disable→Enable gap) |
-| `ready_min_uptime_sec` | 1 | Ready: minimum system uptime (seconds) |
-| `ready_poll_ms` | 200 | Ready poll interval (ms) |
-| `ready_max_wait_sec` | 60 | Ready max wait (seconds) |
-| `pnp_debounce_ms` | 500 | PnP trailing-edge debounce (ms) |
-| `log_max_bytes` | 10485760 | Log rotation threshold (10 MiB) |
-| `pnp_register_wait_sec` | 3 | Seconds to wait for PnP registration |
-| `uptime_bypass` | 60 | When `rec_delay.based=uptime` (including bare number) and current uptime ≥ this value, **ignore sec** and allow Recover immediately; `0` = disable bypass |
+### Deprecated / removed fields and migration (≥ v1.2)
 
-The wait **between Disable and Enable** is a fixed **3 seconds** (hardcoded, not in config); there is no fixed wait after Enable before postcheck. `retry_interval` is only between failed attempts.
+Starting with **v1.2.0**, the fields below are **removed with no compatibility mapping**: JSON may still load, but old keys are **silently ignored and have no effect**. Migrate configs from ≤ v1.1.x before upgrading.
+
+| Old field | Status | Migrate to |
+|-----------|--------|------------|
+| `log_file` | Removed earlier | `log.path` (`log` object required) |
+| `devices[].delay` | **Removed** | `devices[].rec_delay` |
+| `retry_delay` (top-level) | **Removed** | **Do not** set. Disable→Enable gap is a fixed **3 seconds** in code; failed-attempt spacing is `advanced.retry_interval` (default 3) |
+
+**`delay` → `rec_delay`**
+
+| Old | New | Meaning |
+|-----|-----|---------|
+| omit `delay` | omit `rec_delay` or `"rec_delay": 0` | no wait (off by default) |
+| `"delay": 60` | `"rec_delay": 60` | same as `{ "based": "uptime", "sec": 60 }`: allow auto Recover only when system uptime ≥ 60s |
+| (no object form) | `"rec_delay": { "based": "daemon", "sec": 30 }` | 30s after this process started |
+| (no object form) | `"rec_delay": { "based": "device", "sec": 15 }` | 15s after first match of this device in the session |
+| `"retry_delay": 2` | delete the key; optionally `"advanced": { "retry_interval": 3 }` | old value waited after Disable/Enable; new model: fixed 3s only between Disable and Enable; use `retry_interval` between failed attempts |
 
 `rec_delay` clocks:
 - `uptime`: `GetTickCount64` since boot
 - `daemon`: since this process started
-- `device`: first time this matcher/device is matched in Scan/Handle this session (not reset on transient disappear)
+- `device`: first Scan/Handle match for this device in the session (not reset on transient disappear)
+
+**Hardcoded (not configurable):** fixed **3 seconds** only **between** Disable and Enable; no wait if Disable is skipped; **no** fixed wait after Enable before post-check.
+
+### Advanced settings (`advanced`)
+
+Omit the whole `advanced` object for normal use. Add it only to tune Ready / retry pacing / log size / PnP coalescing. Every field is optional; omitted fields use defaults.
+
+Example (trim fields as needed):
+
+```json
+{
+  "log": { "enabled": true, "level": "normal", "path": "" },
+  "devices": [
+    { "friendly_name": "Example Device Name", "max_retries": 10, "rec_delay": 10, "ProblemCode": [43] }
+  ],
+  "advanced": {
+    "retry_interval": 3,
+    "ready_min_uptime_sec": 1,
+    "ready_poll_ms": 200,
+    "ready_max_wait_sec": 60,
+    "pnp_debounce_ms": 500,
+    "log_max_bytes": 10485760,
+    "pnp_register_wait_sec": 3,
+    "uptime_bypass": 60
+  }
+}
+```
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `retry_interval` | `3` | Seconds to wait **after a failed Recover attempt** before the next attempt. **Not** the Disable→Enable gap. Must be ≥ 0. |
+| `ready_min_uptime_sec` | `1` | Ready: minimum system uptime (seconds) before first scan / auto Recover entry. Must be ≥ 0. |
+| `ready_poll_ms` | `200` | Ready poll interval (ms). Must be > 0. |
+| `ready_max_wait_sec` | `60` | Ready max wait (seconds); on timeout the process continues per implementation (still logged). Must be ≥ 0. |
+| `pnp_debounce_ms` | `500` | PnP trailing-edge coalesce window (ms): bursts collapse into one scan. Must be ≥ 0. |
+| `log_max_bytes` | `10485760` (10 MiB) | Truncate/overwrite the log file before write when it exceeds this size. Must be > 0. |
+| `pnp_register_wait_sec` | `3` | Seconds to wait for PnP notification registration at startup. Must be ≥ 0. |
+| `uptime_bypass` | `60` | Only when `rec_delay.based` is `uptime` (including bare-number form): if current system uptime ≥ this value, **ignore** `rec_delay.sec` and allow auto Recover immediately. `0` disables the bypass. Avoids waiting `sec` again when the daemon starts late and uptime is already large. Must be ≥ 0. |
 
 If a target is missing at startup, the process logs “device not found” and keeps listening.
 
