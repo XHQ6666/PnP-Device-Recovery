@@ -6,7 +6,7 @@
 
 在真实 Windows 环境中，部分设备节点会偶发进入异常状态（设备管理器中的问题代码，例如 Code 10 / 31 / 43）。本工具通过 Windows 原生 PnP 通知持续监听配置中的目标设备；一旦确认设备不健康，即在受控条件下自动执行一次软复位式恢复：
 
-**Disable Device → 等待 → Enable Device → 等待驱动重新初始化 → 再次检查状态**
+**Disable Device → 固定 3s → Enable Device → 复查状态**（失败尝试之间另用 `advanced.retry_interval`）
 
 程序直接调用 SetupAPI / CfgMgr32 等 Windows API，**不**依赖 PowerShell、`pnputil`、WMIC 等外部命令解析。
 
@@ -22,7 +22,7 @@
 | 设备偶发异常 | 设备仍在系统中枚举，但带有 Problem Code，功能不可用 |
 | 需要自动软复位 | 手工在设备管理器中「禁用 → 启用」往往有效，希望无人值守自动完成 |
 | 多设备并行监控 | 可同时监控多块不同设备，各自独立重试与状态 |
-| 开机计划任务 | 可作为开机启动项运行；Ready（系统 uptime ≥ 1s）后再首次扫描，并可按设备配置 delay |
+| 开机计划任务 | 可作为开机启动项运行；Ready（系统 uptime ≥ 1s，可用 advanced 调整）后再首次扫描，并可按设备配置 rec_delay |
 
 ---
 
@@ -90,14 +90,14 @@ WAIT_FOR_SYSTEM_READY
   │
   ▼
 INITIAL_SCAN（reason=startup）
-  │  此时才允许首次自动 Recovery（仍受 devices[].delay / ProblemCode 约束）
+  │  此时才允许首次自动 Recovery（仍受 devices[].rec_delay / ProblemCode 约束）
   │
   ▼
 NORMAL_RUNNING
      事件驱动 + 尾沿合并
 ```
 
-真正推迟自动 Recover 请用 `devices[].delay` / `ProblemCode`。Ready 的 1s uptime 与总超时为 **内部常量**，不进 `config.json`。
+真正推迟自动 Recover 请用 `devices[].rec_delay` / `ProblemCode`。Ready 的 uptime/轮询/超时等可通过可选 `advanced` 调整；省略则用默认值。
 
 ---
 
@@ -110,7 +110,7 @@ NORMAL_RUNNING
 - **尾沿事件合并**：短时间内连续 PnP 事件合并为一次扫描，减轻枚举风暴
 - **Exhausted 状态**：达到 `max_retries` 后该设备停止自动恢复；仅 `check` 可清除并重试
 - **Ready 后再首次扫描**：系统 uptime ≥ 1s
-- **每设备 delay / ProblemCode**：自动 Recover 可延后；可按问题代码过滤
+- **每设备 rec_delay / ProblemCode**：自动 Recover 可延后；可按问题代码过滤
 - **Disable/Enable 状态门闩**：仅在设备当前为启用时 Disable，仅在已禁用时 Enable
 - **单实例 + 本地命名管道 IPC**
 - **UAC 自动提权**
@@ -133,15 +133,14 @@ NORMAL_RUNNING
     {
       "friendly_name": "Example Device Name",
       "max_retries": 10,
-      "delay": 60,
+      "rec_delay": 10,
       "ProblemCode": [43]
     },
     {
       "friendly_name": "regex:^Example.*Adapter.*$",
       "max_retries": 5
     }
-  ],
-  "retry_delay": 2
+  ]
 }
 ```
 
@@ -153,9 +152,28 @@ NORMAL_RUNNING
 | `log.path` | 日志路径；空/省略 → 可执行文件目录下 `PnP-Device-Recovery.log`；相对路径相对 exe 目录；绝对路径亦可 |
 | `devices[].friendly_name` | 与设备管理器中的友好名称完全一致；或以 `regex:` 开头使用 Go RE2 |
 | `devices[].max_retries` | 单次 Recovery Session 的最大尝试次数（必须 > 0） |
-| `devices[].delay` | 进程启动后多少秒才允许 **自动** Recover；省略 = 0；`check` **忽略** delay |
+| `devices[].rec_delay` | 自动 Recover 前额外等待（**默认关**）。裸数字 `N` ≡ `{"based":"uptime","sec":N}`；对象须同时含 `based`（`uptime`\|`daemon`\|`device`）与 `sec`；**省略或 0** 则关闭不等。`check` 忽略。 |
 | `devices[].ProblemCode` | 单个数字或数字数组；仅当设备当前 ProblemCode 落在集合内才 Recover；省略 = 不额外过滤 |
-| `retry_delay` | Disable / Enable 之后的等待秒数（必须 ≥ 0；全局） |
+| `advanced` | **可选**对象；省略对象或字段时使用代码默认值（见下表） |
+#### `advanced`（均可选）
+
+| 字段 | 默认 | 说明 |
+|------|------|------|
+| `retry_interval` | 3 | 失败 Recover **尝试**之间的间隔秒数（不是 Disable→Enable 间隔） |
+| `ready_min_uptime_sec` | 1 | Ready：系统 uptime 至少秒数 |
+| `ready_poll_ms` | 200 | Ready 轮询间隔（毫秒） |
+| `ready_max_wait_sec` | 60 | Ready 最长等待秒数 |
+| `pnp_debounce_ms` | 500 | PnP 尾沿合并间隔（毫秒） |
+| `log_max_bytes` | 10485760 | 日志轮转阈值（10 MiB） |
+| `pnp_register_wait_sec` | 3 | 等待 PnP 注册完成的秒数 |
+| `uptime_bypass` | 60 | 当 `rec_delay.based=uptime`（含裸数字）且当前 uptime ≥ 此值时，**忽略 sec** 立即允许 Recover；`0` = 关闭旁路 |
+
+**Disable→Enable** 之间固定等待 **3 秒**（硬编码，不进配置）；Enable 后复查不再固定等待。`retry_interval` 仅用于失败尝试之间。
+
+`rec_delay` 时钟：
+- `uptime`：`GetTickCount64` 开机以来毫秒
+- `daemon`：本进程启动以来
+- `device`：本会话中该设备首次被 Scan/Handle 匹配的时间（短暂消失不重置）
 
 启动时若目标设备尚未枚举：记录「device not found」并继续监听，待后续 PnP 事件再处理。
 
@@ -173,18 +191,18 @@ Instance ID 比较 **不区分大小写**，避免同一设备因大小写差异
 ```
 发现异常（且非 Exhausted）
     ↓
-自动路径：未满 devices[].delay？→ 跳过，继续监听
+自动路径：未满 devices[].rec_delay？→ 跳过，继续监听
 ProblemCode 已配置且不匹配？→ 跳过
     ↓
 开启 Recovery Session（同设备事件合并，不并发）
     ↓
 若当前为启用 → Disable；若已禁用则跳过 Disable（不强制）
     ↓
-等待 retry_delay
+等待固定 3s（仅 Disable→Enable）
     ↓
 若当前为禁用 → Enable；若已启用则跳过 Enable（不强制）
     ↓
-等待 → 复查
+复查
     ↓
 ┌──────────┴──────────┐
 成功                   仍异常
@@ -202,7 +220,7 @@ ProblemCode 已配置且不匹配？→ 跳过
 
 - 达到 `max_retries` **不会** `os.Exit()`，也 **不会** 停止全局 PnP 监听
 - Exhausted 设备遇到普通 PnP 事件只记录状态，不自动开新会话
-- `PnP-Device-Recovery.exe check` 清除 Exhausted 并重新检测；**忽略** `delay`，但仍应用 ProblemCode 过滤与 Disable/Enable 状态门闩；若仍异常，新会话从 attempt = 1 开始
+- `PnP-Device-Recovery.exe check` 清除 Exhausted 并重新检测；**忽略** `rec_delay`，但仍应用 ProblemCode 过滤与 Disable/Enable 状态门闩；若仍异常，新会话从 attempt = 1 开始
 - 禁用/启用判定：CfgMgr `CM_PROB_DISABLED`（22）；设备可「已启用但仍不健康」（如 Code 43）
 
 ---
@@ -300,7 +318,7 @@ pnputil /enum-devices /problem
 | UAC 后仍退出 | 用户拒绝提升权限 |
 | `status` 显示 not running | 守护进程未启动 |
 | Exhausted 后不再自动恢复 | 预期行为；运行 `check` |
-| 启动后较久才第一次扫描 | 正在等待 uptime ≥ 1s 或 `devices[].delay` |
+| 启动后较久才第一次扫描 | 正在等待 uptime ≥ 1s 或 `devices[].rec_delay` |
 | 找不到设备 | FriendlyName 与设备管理器不一致；可改用 `regex:` |
 | 日志突然变短 | 已超过 10 MiB，写入前截断覆盖 |
 | Disable / Enable 失败 | 查看日志中的 `api=… result=CR_xxx` |
@@ -311,9 +329,9 @@ pnputil /enum-devices /problem
 
 以下为真实环境中的一种用法示例，并非程序唯一用途。任意可通过 FriendlyName 匹配、且 Disable/Enable 有效的 PnP 设备均可纳入配置。
 
-某笔记本**内置显示器损坏**后，独显报 **Code 43**，外接显示器也无法正常使用。将 FriendlyName（例如 `NVIDIA GeForce RTX 3060 Laptop GPU`）写入 `config.json`，并配置 `ProblemCode: [43]` 与合适的 `delay` 后，程序在 Ready 与延时条件满足后检测到该状态，执行 Disable → Enable；随后可见相关 GPU / Display 等 PnP 到达与移除事件，复查后 ProblemCode 回到 0，外接输出恢复可用。
+某笔记本**内置显示器损坏**后，独显报 **Code 43**，外接显示器也无法正常使用。将 FriendlyName（例如 `NVIDIA GeForce RTX 3060 Laptop GPU`）写入 `config.json`，并配置 `ProblemCode: [43]` 与合适的 `rec_delay` 后，程序在 Ready 与延时条件满足后检测到该状态，执行 Disable → Enable；随后可见相关 GPU / Display 等 PnP 到达与移除事件，复查后 ProblemCode 回到 0，外接输出恢复可用。
 
-在 **dGPU-only / MUX** 等机器上，若在 Boot 画面阶段就对 GPU 做 Disable/Enable，可能造成显示输出异常甚至黑屏。本工具以系统 uptime ≥ 1s 作为 Ready，并建议用 `devices[].delay` / `ProblemCode` 进一步推迟与过滤自动 Recover。
+在 **dGPU-only / MUX** 等机器上，若在 Boot 画面阶段就对 GPU 做 Disable/Enable，可能造成显示输出异常甚至黑屏。本工具以系统 uptime ≥ 1s 作为 Ready，并建议用 `devices[].rec_delay` / `ProblemCode` 进一步推迟与过滤自动 Recover。
 
 ---
 
@@ -353,7 +371,7 @@ A lightweight **Windows PnP device auto-recovery** daemon.
 
 On real Windows systems, some device nodes occasionally enter a problem state (Device Manager problem codes such as Code 10 / 31 / 43). This tool listens for configured targets via native Windows PnP notifications and, when a device is unhealthy, performs a controlled soft reset:
 
-**Disable Device → wait → Enable Device → wait for driver re-initialization → re-check status**
+**Disable Device → fixed 3s → Enable Device → post-check** (failed attempts use `advanced.retry_interval`)
 
 It calls SetupAPI / CfgMgr32 and related Windows APIs directly. It does **not** shell out to PowerShell, `pnputil`, or WMIC.
 
@@ -437,14 +455,14 @@ WAIT_FOR_SYSTEM_READY
   │
   ▼
 INITIAL_SCAN (reason=startup)
-  │  First automatic Recovery allowed here (still subject to devices[].delay / ProblemCode)
+  │  First automatic Recovery allowed here (still subject to devices[].rec_delay / ProblemCode)
   │
   ▼
 NORMAL_RUNNING
      Event-driven + trailing-edge coalescing
 ```
 
-Defer automatic Recover with `devices[].delay` / `ProblemCode`. The 1s uptime gate and max wait are **internal constants**, not `config.json` fields.
+Defer automatic Recover with `devices[].rec_delay` / `ProblemCode`. Ready uptime/poll/max-wait are tunable via optional `advanced` (defaults if omitted).
 
 ---
 
@@ -457,7 +475,7 @@ Defer automatic Recover with `devices[].delay` / `ProblemCode`. The 1s uptime ga
 - **Trailing-edge coalescing**: bursts of PnP events collapse into one scan
 - **Exhausted state**: after `max_retries`, no more automatic recovery until `check`
 - **Ready before first scan**: system uptime ≥ 1s
-- **Per-device delay / ProblemCode**: defer automatic Recover; filter by problem codes
+- **Per-device rec_delay / ProblemCode**: defer automatic Recover; filter by problem codes
 - **Disable/Enable state gates**: Disable only when enabled; Enable only when disabled
 - **Single instance + local named-pipe IPC**
 - **UAC auto-elevation**
@@ -480,15 +498,14 @@ Place `config.json` next to the executable. The `log` object is **required**. Re
     {
       "friendly_name": "Example Device Name",
       "max_retries": 10,
-      "delay": 60,
+      "rec_delay": 10,
       "ProblemCode": [43]
     },
     {
       "friendly_name": "regex:^Example.*Adapter.*$",
       "max_retries": 5
     }
-  ],
-  "retry_delay": 2
+  ]
 }
 ```
 
@@ -500,9 +517,28 @@ Place `config.json` next to the executable. The `log` object is **required**. Re
 | `log.path` | Log path; empty/omit → `PnP-Device-Recovery.log` under the exe directory; relative paths are relative to the exe directory; absolute paths OK |
 | `devices[].friendly_name` | Exact Device Manager friendly name, or `regex:` + Go RE2 |
 | `devices[].max_retries` | Max attempts per Recovery Session (must be > 0) |
-| `devices[].delay` | Seconds after process start before **automatic** Recover is allowed; omit = 0; `check` **ignores** delay |
+| `devices[].rec_delay` | Extra wait before **automatic** Recover (**off by default**). Bare number `N` ≡ `{"based":"uptime","sec":N}`; object requires `based` (`uptime`\|`daemon`\|`device`) and `sec`; **omit or 0** disables. Ignored by `check`. |
 | `devices[].ProblemCode` | Number or array of numbers; Recover only when the device's current ProblemCode is in the set; omit = no extra filter |
-| `retry_delay` | Seconds to wait after Disable / Enable (must be ≥ 0; global) |
+| `advanced` | **Optional** object; omit object or field → code defaults (see table below) |
+#### `advanced` (all optional)
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `retry_interval` | 3 | Seconds between failed Recover **attempts** (not the Disable→Enable gap) |
+| `ready_min_uptime_sec` | 1 | Ready: minimum system uptime (seconds) |
+| `ready_poll_ms` | 200 | Ready poll interval (ms) |
+| `ready_max_wait_sec` | 60 | Ready max wait (seconds) |
+| `pnp_debounce_ms` | 500 | PnP trailing-edge debounce (ms) |
+| `log_max_bytes` | 10485760 | Log rotation threshold (10 MiB) |
+| `pnp_register_wait_sec` | 3 | Seconds to wait for PnP registration |
+| `uptime_bypass` | 60 | When `rec_delay.based=uptime` (including bare number) and current uptime ≥ this value, **ignore sec** and allow Recover immediately; `0` = disable bypass |
+
+The wait **between Disable and Enable** is a fixed **3 seconds** (hardcoded, not in config); there is no fixed wait after Enable before postcheck. `retry_interval` is only between failed attempts.
+
+`rec_delay` clocks:
+- `uptime`: `GetTickCount64` since boot
+- `daemon`: since this process started
+- `device`: first time this matcher/device is matched in Scan/Handle this session (not reset on transient disappear)
 
 If a target is missing at startup, the process logs “device not found” and keeps listening.
 
@@ -520,18 +556,18 @@ Instance ID comparison is **case-insensitive**.
 ```
 Unhealthy (and not Exhausted)
     ↓
-Auto path: devices[].delay not elapsed? → skip, keep listening
+Auto path: devices[].rec_delay not elapsed? → skip, keep listening
 ProblemCode configured and not in set? → skip
     ↓
 Start Recovery Session (coalesce per device; no concurrent sessions)
     ↓
 If currently enabled → Disable; if already disabled, skip Disable (do not force)
     ↓
-wait retry_delay
+wait fixed 3s (Disable→Enable only)
     ↓
 If currently disabled → Enable; if already enabled, skip Enable (do not force)
     ↓
-wait → re-check
+re-check
     ↓
 ┌──────────┴──────────┐
 Success                Still unhealthy
@@ -549,7 +585,7 @@ Reset to Idle          attempt + 1
 
 - Hitting `max_retries` does **not** `os.Exit()` and does **not** stop the global PnP listener
 - Exhausted devices only log on ordinary PnP events; no new automatic session
-- `PnP-Device-Recovery.exe check` clears Exhausted and rescans; it **ignores** `delay` but still applies the ProblemCode filter and Disable/Enable state gates; a new session starts at attempt = 1 if still unhealthy
+- `PnP-Device-Recovery.exe check` clears Exhausted and rescans; it **ignores** `rec_delay` but still applies the ProblemCode filter and Disable/Enable state gates; a new session starts at attempt = 1 if still unhealthy
 - Disabled vs enabled: CfgMgr `CM_PROB_DISABLED` (22); a device may be enabled yet unhealthy (e.g. Code 43)
 
 ---
@@ -647,7 +683,7 @@ pnputil /enum-devices /problem
 | Still exits after UAC | Elevation denied |
 | `status` → not running | Daemon not started |
 | No auto recovery after Exhausted | Expected; run `check` |
-| Long delay before first scan | Waiting for uptime ≥ 1s or devices[].delay |
+| Long delay before first scan | Waiting for uptime ≥ 1s or devices[].rec_delay |
 | Device not found | FriendlyName mismatch; try `regex:` |
 | Log suddenly short | Exceeded 10 MiB; truncated before write |
 | Disable / Enable failed | Check log for `api=… result=CR_xxx` |
@@ -658,9 +694,9 @@ pnputil /enum-devices /problem
 
 This is one real-world usage example, not the only purpose. Any PnP device that matches by FriendlyName and benefits from Disable/Enable can be configured.
 
-After a laptop **built-in panel failed**, the discrete GPU reported **Code 43** and the **external display was also unusable**. With its FriendlyName (e.g. `NVIDIA GeForce RTX 3060 Laptop GPU`) in `config.json`, plus `ProblemCode: [43]` and an appropriate `delay`, the tool detected that state after Ready/delay, ran Disable → Enable, observed related GPU / Display PnP arrival/removal events, then saw ProblemCode return to 0 and external output become usable again.
+After a laptop **built-in panel failed**, the discrete GPU reported **Code 43** and the **external display was also unusable**. With its FriendlyName (e.g. `NVIDIA GeForce RTX 3060 Laptop GPU`) in `config.json`, plus `ProblemCode: [43]` and an appropriate `rec_delay`, the tool detected that state after Ready/delay, ran Disable → Enable, observed related GPU / Display PnP arrival/removal events, then saw ProblemCode return to 0 and external output become usable again.
 
-On some **dGPU-only / MUX** machines, Disable/Enable of the GPU during the Boot screen can blank the display. This tool uses system uptime ≥ 1s as Ready; further gate automatic Recover with `devices[].delay` / `ProblemCode`.
+On some **dGPU-only / MUX** machines, Disable/Enable of the GPU during the Boot screen can blank the display. This tool uses system uptime ≥ 1s as Ready; further gate automatic Recover with `devices[].rec_delay` / `ProblemCode`.
 
 ---
 

@@ -11,10 +11,10 @@ func newTestDaemon(t *testing.T) *Daemon {
 	t.Helper()
 	lg := testLogger(t)
 	cfg := &Config{
-		Log:        &LogConfig{Enabled: true, Level: LogLevelNormal, Path: "x.log"},
-		Devices:    []DeviceConfig{{FriendlyName: "TestDev", MaxRetries: 2}},
-		RetryDelay: 0,
+		Log:     &LogConfig{Enabled: true, Level: LogLevelNormal, Path: "x.log"},
+		Devices: []DeviceConfig{{FriendlyName: "TestDev", MaxRetries: 2}},
 	}
+	cfg.resolved = defaultAdvancedValues()
 	ms, err := BuildMatchers(cfg.Devices)
 	if err != nil {
 		t.Fatal(err)

@@ -14,6 +14,9 @@ const (
 	StateExhausted  = "Exhausted"
 )
 
+// Hardcoded wait between Disable and Enable only (not a config field).
+const disableEnableGap = defaultDisableEnableGapSec * time.Second
+
 // deviceOps lets tests stub SetupAPI/CfgMgr32.
 type deviceOps struct {
 	Enumerate          func() ([]DeviceInfo, error)
@@ -37,17 +40,21 @@ func realDeviceOps() deviceOps {
 // Same device never runs concurrent recoveries (events coalesce).
 // Exhausted devices do not auto-retry on normal PnP events — only check clears.
 type RecoveryManager struct {
-	cfg          *Config
-	matchers     []*Matcher
-	logger       *Logger
-	delay        time.Duration // retry_delay between disable/enable
-	ops          deviceOps
-	processStart time.Time
+	cfg           *Config
+	matchers      []*Matcher
+	logger        *Logger
+	gap           time.Duration // fixed wait between Disable and Enable only
+	retryInterval time.Duration // between failed Recover attempts
+	uptimeBypass  time.Duration // ignore uptime-based sec when uptime >= this (0=off)
+	ops           deviceOps
+	processStart  time.Time
+	uptimeFn      func() (time.Duration, bool)
 
-	mu       sync.Mutex
-	sessions map[string]*deviceSession // key: NormalizeInstanceID
-	wg       sync.WaitGroup
-	stopping bool
+	mu        sync.Mutex
+	sessions  map[string]*deviceSession // key: NormalizeInstanceID / cfg key
+	firstSeen map[string]time.Time      // per session key; device-based rec_delay
+	wg        sync.WaitGroup
+	stopping  bool
 }
 
 type deviceSession struct {
@@ -62,16 +69,21 @@ type deviceSession struct {
 }
 
 // NewRecoveryManager creates a manager for the given config and matchers.
-// processStart is set to now and used for per-device delay gating.
+// processStart is set to now and used for daemon-based rec_delay gating.
 func NewRecoveryManager(cfg *Config, matchers []*Matcher, logger *Logger) *RecoveryManager {
+	adv := cfg.AdvancedResolved()
 	return &RecoveryManager{
-		cfg:          cfg,
-		matchers:     matchers,
-		logger:       logger,
-		delay:        time.Duration(cfg.RetryDelay) * time.Second,
-		ops:          realDeviceOps(),
-		processStart: time.Now(),
-		sessions:     make(map[string]*deviceSession),
+		cfg:           cfg,
+		matchers:      matchers,
+		logger:        logger,
+		gap:           disableEnableGap,
+		retryInterval: time.Duration(adv.RetryInterval) * time.Second,
+		uptimeBypass:  time.Duration(adv.UptimeBypass) * time.Second,
+		ops:           realDeviceOps(),
+		processStart:  time.Now(),
+		uptimeFn:      systemUptime,
+		sessions:      make(map[string]*deviceSession),
+		firstSeen:     make(map[string]time.Time),
 	}
 }
 
@@ -79,9 +91,26 @@ func (rm *RecoveryManager) setOps(ops deviceOps) {
 	rm.ops = ops
 }
 
-// setProcessStartForTest overrides the delay clock (tests only).
+// setProcessStartForTest overrides the daemon clock (tests only).
 func (rm *RecoveryManager) setProcessStartForTest(t time.Time) {
 	rm.processStart = t
+}
+
+// setGapForTest overrides the Disable→Enable gap (tests only; production uses 3s).
+func (rm *RecoveryManager) setGapForTest(d time.Duration) {
+	rm.gap = d
+}
+
+// setUptimeFnForTest injects an uptime clock (tests only).
+func (rm *RecoveryManager) setUptimeFnForTest(fn func() (time.Duration, bool)) {
+	rm.uptimeFn = fn
+}
+
+// setFirstSeenForTest seeds device-based firstSeen (tests only).
+func (rm *RecoveryManager) setFirstSeenForTest(key string, t time.Time) {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	rm.firstSeen[key] = t
 }
 
 func sessionKey(instanceID, friendlyName string, cfgIdx int) string {
@@ -89,6 +118,19 @@ func sessionKey(instanceID, friendlyName string, cfgIdx int) string {
 		return NormalizeInstanceID(instanceID)
 	}
 	return fmt.Sprintf("cfg:%d:%s", cfgIdx, friendlyName)
+}
+
+// noteFirstSeen records the first match time for a session key (device clock).
+// Does not reset if the device later disappears transiently.
+func (rm *RecoveryManager) noteFirstSeen(key string) time.Time {
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+	if t, ok := rm.firstSeen[key]; ok {
+		return t
+	}
+	now := time.Now()
+	rm.firstSeen[key] = now
+	return now
 }
 
 // StopNewWork prevents starting new recovery sessions (shutdown).
@@ -130,8 +172,8 @@ func (rm *RecoveryManager) ClearExhausted() {
 }
 
 // Scan enumerates devices and starts recovery for unhealthy configured matches.
-// reason=check clears Exhausted first and ignores per-device delay.
-// reason=pnp_event / startup skip Exhausted and apply delay.
+// reason=check clears Exhausted first and ignores per-device rec_delay.
+// reason=pnp_event / startup skip Exhausted and apply rec_delay.
 func (rm *RecoveryManager) Scan(ctx context.Context, reason ScanReason) {
 	rm.logger.Infof("scan start: reason=%s trigger_instance=%q trigger_action=%q ignore_delay=%v",
 		reason.Reason, reason.TriggerInstance, reason.TriggerAction, reason.IgnoreDelay)
@@ -156,6 +198,8 @@ func (rm *RecoveryManager) Scan(ctx context.Context, reason ScanReason) {
 				continue
 			}
 			found = true
+			key := sessionKey(dev.InstanceID, dev.FriendlyName, m.Index())
+			rm.noteFirstSeen(key)
 			if dev.DevInst != 0 {
 				rm.logger.Infof("scan match: reason=%s pattern=%q name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d healthy=%v",
 					reason.Reason, m.Pattern(), dev.FriendlyName, dev.InstanceID, dev.DevInst, dev.Status, dev.ProblemCode, dev.IsHealthy())
@@ -177,9 +221,61 @@ func (rm *RecoveryManager) Scan(ctx context.Context, reason ScanReason) {
 	}
 }
 
+// recDelayAllows reports whether the automatic Recover gate has elapsed.
+// check / IgnoreDelay always allows. uptime_bypass only applies to based=uptime.
+func (rm *RecoveryManager) recDelayAllows(dcfg *DeviceConfig, key, friendlyName string, ignoreDelay bool) bool {
+	if ignoreDelay || dcfg == nil || !dcfg.RecDelay.Present || dcfg.RecDelay.Sec == 0 {
+		return true
+	}
+	need := time.Duration(dcfg.RecDelay.Sec) * time.Second
+	based := dcfg.RecDelay.Based
+
+	var elapsed time.Duration
+	var clockLabel string
+	switch based {
+	case recDelayBasedUptime:
+		clockLabel = "uptime"
+		fn := rm.uptimeFn
+		if fn == nil {
+			fn = systemUptime
+		}
+		up, ok := fn()
+		if !ok {
+			rm.logger.Warnf("skip Recover: uptime clock unavailable for %q; keep listening", friendlyName)
+			return false
+		}
+		if rm.uptimeBypass > 0 && up >= rm.uptimeBypass {
+			rm.logger.Infof("rec_delay uptime_bypass: uptime=%s >= bypass=%s; ignore sec=%d for %q",
+				up.Round(time.Millisecond), rm.uptimeBypass, dcfg.RecDelay.Sec, friendlyName)
+			return true
+		}
+		elapsed = up
+	case recDelayBasedDaemon:
+		clockLabel = "daemon"
+		elapsed = time.Since(rm.processStart)
+	case recDelayBasedDevice:
+		clockLabel = "device"
+		seen := rm.noteFirstSeen(key)
+		elapsed = time.Since(seen)
+	default:
+		rm.logger.Warnf("skip Recover: unknown rec_delay.based=%q for %q", based, friendlyName)
+		return false
+	}
+
+	if elapsed < need {
+		remain := need - elapsed
+		rm.logger.Infof("skip Recover: rec_delay not elapsed for %q (based=%s sec=%d elapsed=%.1fs remain=%.1fs); keep listening",
+			friendlyName, clockLabel, dcfg.RecDelay.Sec, elapsed.Seconds(), remain.Seconds())
+		rm.logger.Debugf("rec_delay gate detail: key=%q based=%s process_start=%s ignore_delay=%v",
+			key, based, rm.processStart.Format(time.RFC3339Nano), ignoreDelay)
+		return false
+	}
+	return true
+}
+
 // HandleDeviceProblem starts a recovery session if the device matches and is unhealthy.
 // Exhausted devices are skipped (use check). Same device is serial; different devices parallel.
-// ignoreDelay=true (IPC/CLI check) skips the per-device delay gate but still applies
+// ignoreDelay=true (IPC/CLI check) skips the per-device rec_delay gate but still applies
 // ProblemCode filter and enable/disable state gates.
 func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *DeviceInfo, ignoreDelay bool) {
 	if info == nil {
@@ -189,6 +285,9 @@ func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *Device
 	if m == nil {
 		return
 	}
+	key := sessionKey(info.InstanceID, info.FriendlyName, m.Index())
+	rm.noteFirstSeen(key)
+
 	if info.IsHealthy() {
 		rm.logger.Infof("device healthy, skip recovery: name=%q instance=%q resolved_DEVINST=%d status=0x%X problem=%d",
 			info.FriendlyName, info.InstanceID, info.DevInst, info.Status, info.ProblemCode)
@@ -204,21 +303,10 @@ func (rm *RecoveryManager) HandleDeviceProblem(ctx context.Context, info *Device
 		return
 	}
 
-	// Per-device delay since process start (auto only; check ignores).
-	if !ignoreDelay {
-		need := time.Duration(dcfg.DelaySeconds()) * time.Second
-		elapsed := time.Since(rm.processStart)
-		if need > 0 && elapsed < need {
-			remain := need - elapsed
-			rm.logger.Infof("skip Recover: delay not elapsed for %q (delay=%ds elapsed=%.1fs remain=%.1fs); keep listening",
-				info.FriendlyName, dcfg.DelaySeconds(), elapsed.Seconds(), remain.Seconds())
-			rm.logger.Debugf("delay gate detail: instance=%q process_start=%s ignore_delay=%v",
-				info.InstanceID, rm.processStart.Format(time.RFC3339Nano), ignoreDelay)
-			return
-		}
+	// Per-device rec_delay (auto only; check ignores).
+	if !rm.recDelayAllows(dcfg, key, info.FriendlyName, ignoreDelay) {
+		return
 	}
-
-	key := sessionKey(info.InstanceID, info.FriendlyName, m.Index())
 
 	rm.mu.Lock()
 	if rm.stopping {
@@ -348,6 +436,7 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 
 		// Before Disable: must be ENABLED; if already disabled, skip Disable.
 		info = rm.refreshDevice(info)
+		didDisable := false
 		if info.IsDisabled() {
 			rm.logger.Infof("skip Disable: device already disabled (ProblemCode=%d status=0x%X DN_STARTED=%v) name=%q instance=%q",
 				info.ProblemCode, info.Status, info.Status&DN_STARTED != 0, info.FriendlyName, info.InstanceID)
@@ -359,11 +448,15 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 			} else {
 				rm.logger.Infof("disable OK for %q (%s)", info.FriendlyName, key)
 			}
+			didDisable = true
 		}
 
-		if !sleepOrDone(ctx, rm.delay) {
-			rm.logger.Warnf("recovery cancelled during post-disable sleep for %q", info.FriendlyName)
-			return
+		// Fixed 3s only between Disable and Enable actions (not after Enable, not between attempts).
+		if didDisable {
+			if !sleepOrDone(ctx, rm.gap) {
+				rm.logger.Warnf("recovery cancelled during post-disable sleep for %q", info.FriendlyName)
+				return
+			}
 		}
 
 		// Before Enable: must be DISABLED; if already enabled, skip Enable.
@@ -381,11 +474,7 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 			}
 		}
 
-		if !sleepOrDone(ctx, rm.delay) {
-			rm.logger.Warnf("recovery cancelled during post-enable sleep for %q", info.FriendlyName)
-			return
-		}
-
+		// No fixed wait after Enable — only Disable→Enable uses disableEnableGap.
 		post := rm.refreshDevice(info)
 		if post.InstanceID != "" && post.DevInst != 0 {
 			rm.logger.Infof("resolved_DEVINST=%d instance=%q (post-recovery recheck)", post.DevInst, post.InstanceID)
@@ -405,6 +494,14 @@ func (rm *RecoveryManager) runSession(ctx context.Context, sess *deviceSession, 
 
 		rm.logger.Warnf("recovery attempt %d/%d did not restore %q (%s); status=0x%X problem=%d",
 			attempt, maxR, post.FriendlyName, key, post.Status, post.ProblemCode)
+
+		// Between failed attempts: advanced.retry_interval (not the Disable↔Enable gap).
+		if attempt < maxR {
+			if !sleepOrDone(ctx, rm.retryInterval) {
+				rm.logger.Warnf("recovery cancelled during retry_interval sleep for %q", post.FriendlyName)
+				return
+			}
+		}
 	}
 }
 

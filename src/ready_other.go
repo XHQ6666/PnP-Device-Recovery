@@ -2,11 +2,17 @@
 
 package main
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 // WaitForSystemReady returns immediately on non-Windows (tests / stubs).
-func WaitForSystemReady(ctx context.Context, logger *Logger) error {
+func WaitForSystemReady(ctx context.Context, logger *Logger, minUptime, poll, maxWait time.Duration) error {
 	_ = ctx
+	_ = minUptime
+	_ = poll
+	_ = maxWait
 	if logger != nil {
 		logger.Infof("WAIT_FOR_SYSTEM_READY: skipped (non-Windows stub)")
 	}

@@ -8,7 +8,7 @@ import (
 
 func TestWaitForSystemReadyStub(t *testing.T) {
 	start := time.Now()
-	if err := WaitForSystemReady(context.Background(), testLogger(t)); err != nil {
+	if err := WaitForSystemReady(context.Background(), testLogger(t), 0, 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	if time.Since(start) > time.Second {

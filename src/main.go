@@ -78,6 +78,7 @@ func runOneShotCheck() int {
 		fmt.Fprintf(os.Stderr, "logger error: %v\n", err)
 		return 1
 	}
+	logger.SetMaxBytes(cfg.AdvancedResolved().LogMaxBytes)
 	defer logger.Close()
 
 	logger.Infof("one-shot check (daemon not running); config=%s", cfgPath)
@@ -135,6 +136,7 @@ func runDaemon() int {
 		fmt.Fprintf(os.Stderr, "logger error: %v\n", err)
 		return 1
 	}
+	logger.SetMaxBytes(cfg.AdvancedResolved().LogMaxBytes)
 	defer logger.Close()
 
 	logger.Infof("PnP Device Recovery daemon starting; config=%s", cfgPath)
@@ -200,7 +202,11 @@ func runDaemon() int {
 		}
 	}()
 
-	deadline := time.Now().Add(3 * time.Second)
+	regWait := time.Duration(cfg.AdvancedResolved().PnpRegisterWaitSec) * time.Second
+	if regWait <= 0 {
+		regWait = time.Duration(defaultPnpRegisterWaitSec) * time.Second
+	}
+	deadline := time.Now().Add(regWait)
 	for time.Now().Before(deadline) {
 		if listener.Registered() {
 			break
@@ -214,7 +220,8 @@ func runDaemon() int {
 	logger.Infof("REGISTER_PNP_NOTIFICATION: registered=%v", listener.Registered())
 
 	d.SetPhase(PhaseWaitForSystemReady)
-	if err := WaitForSystemReady(d.ctx, logger); err != nil {
+	minUp, poll, maxWait := cfg.ReadyDurations()
+	if err := WaitForSystemReady(d.ctx, logger, minUp, poll, maxWait); err != nil {
 		logger.Infof("ready wait ended: %v", err)
 		return d.Shutdown()
 	}

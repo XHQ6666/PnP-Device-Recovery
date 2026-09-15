@@ -42,7 +42,7 @@ Usage:
   PnP-Device-Recovery.exe status       Print daemon status
   PnP-Device-Recovery.exe help         Show this help
 
-Config: config.json next to the executable (log / devices / friendly_name / max_retries / delay / ProblemCode / retry_delay).
+Config: config.json next to the executable (log / devices / friendly_name / max_retries / rec_delay / ProblemCode / optional advanced).
 `)
 }
 

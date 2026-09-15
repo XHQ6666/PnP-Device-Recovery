@@ -24,8 +24,7 @@ func validLogJSON() string {
 func TestLoadConfigOK(t *testing.T) {
 	path := writeTempConfig(t, `{
 		`+validLogJSON()+`,
-		"devices": [{"friendly_name": "Foo Device", "max_retries": 3, "delay": 60, "ProblemCode": [43]}],
-		"retry_delay": 2
+		"devices": [{"friendly_name": "Foo Device", "max_retries": 3, "rec_delay": 60, "ProblemCode": [43]}]
 	}`)
 	cfg, err := LoadConfig(path)
 	if err != nil {
@@ -34,19 +33,84 @@ func TestLoadConfigOK(t *testing.T) {
 	if len(cfg.Devices) != 1 || cfg.Devices[0].FriendlyName != "Foo Device" {
 		t.Fatalf("unexpected devices: %+v", cfg.Devices)
 	}
-	if cfg.RetryDelay != 2 || cfg.Log == nil || !cfg.Log.Enabled || cfg.Log.Path != "test.log" {
+	if cfg.Log == nil || !cfg.Log.Enabled || cfg.Log.Path != "test.log" {
 		t.Fatalf("unexpected fields: %+v", cfg)
 	}
-	if cfg.Devices[0].Delay != 60 || !cfg.Devices[0].MatchesProblemCode(43) || cfg.Devices[0].MatchesProblemCode(10) {
-		t.Fatalf("unexpected device fields: %+v", cfg.Devices[0])
+	rd := cfg.Devices[0].RecDelay
+	if !rd.Present || rd.Based != "uptime" || rd.Sec != 60 {
+		t.Fatalf("rec_delay bare number: %+v", rd)
+	}
+	if !cfg.Devices[0].MatchesProblemCode(43) || cfg.Devices[0].MatchesProblemCode(10) {
+		t.Fatalf("unexpected ProblemCode: %+v", cfg.Devices[0])
+	}
+	adv := cfg.AdvancedResolved()
+	if adv.RetryInterval != 3 || adv.UptimeBypass != 60 || adv.LogMaxBytes != defaultLogMaxBytes {
+		t.Fatalf("expected advanced defaults, got %+v", adv)
+	}
+}
+
+func TestLoadConfigRecDelayObject(t *testing.T) {
+	path := writeTempConfig(t, `{
+		`+validLogJSON()+`,
+		"devices": [{
+			"friendly_name": "Foo",
+			"max_retries": 1,
+			"rec_delay": {"based": "daemon", "sec": 15}
+		}]
+	}`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rd := cfg.Devices[0].RecDelay
+	if !rd.Present || rd.Based != "daemon" || rd.Sec != 15 {
+		t.Fatalf("rec_delay object: %+v", rd)
+	}
+}
+
+func TestLoadConfigRecDelayOmit(t *testing.T) {
+	path := writeTempConfig(t, `{
+		`+validLogJSON()+`,
+		"devices": [{"friendly_name": "Foo", "max_retries": 1}]
+	}`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Devices[0].RecDelay.Present {
+		t.Fatalf("omit rec_delay should not be Present: %+v", cfg.Devices[0].RecDelay)
+	}
+}
+
+func TestLoadConfigAdvancedOverrides(t *testing.T) {
+	path := writeTempConfig(t, `{
+		`+validLogJSON()+`,
+		"devices": [{"friendly_name": "Foo", "max_retries": 1}],
+		"advanced": {
+			"retry_interval": 5,
+			"uptime_bypass": 0,
+			"pnp_debounce_ms": 100,
+			"log_max_bytes": 1024
+		}
+	}`)
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	adv := cfg.AdvancedResolved()
+	if adv.RetryInterval != 5 || adv.UptimeBypass != 0 || adv.PnpDebounceMs != 100 || adv.LogMaxBytes != 1024 {
+		t.Fatalf("advanced overrides: %+v", adv)
+	}
+	// Unset fields keep defaults
+	if adv.ReadyMinUptimeSec != 1 || adv.PnpRegisterWaitSec != 3 {
+		t.Fatalf("partial advanced should keep other defaults: %+v", adv)
 	}
 }
 
 func TestLoadConfigProblemCodeNumber(t *testing.T) {
 	path := writeTempConfig(t, `{
 		`+validLogJSON()+`,
-		"devices": [{"friendly_name": "Foo", "max_retries": 1, "ProblemCode": 43}],
-		"retry_delay": 0
+		"devices": [{"friendly_name": "Foo", "max_retries": 1, "ProblemCode": 43}]
 	}`)
 	cfg, err := LoadConfig(path)
 	if err != nil {
@@ -73,7 +137,7 @@ func TestLoadConfigBadJSON(t *testing.T) {
 }
 
 func TestValidateMissingLog(t *testing.T) {
-	cfg := &Config{Devices: []DeviceConfig{{FriendlyName: "X", MaxRetries: 1}}, RetryDelay: 0}
+	cfg := &Config{Devices: []DeviceConfig{{FriendlyName: "X", MaxRetries: 1}}}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "log object is required") {
 		t.Fatalf("expected missing log error, got %v", err)
@@ -82,9 +146,8 @@ func TestValidateMissingLog(t *testing.T) {
 
 func TestValidateBadLogLevel(t *testing.T) {
 	cfg := &Config{
-		Log:        &LogConfig{Enabled: true, Level: "verbose", Path: ""},
-		Devices:    []DeviceConfig{{FriendlyName: "X", MaxRetries: 1}},
-		RetryDelay: 0,
+		Log:     &LogConfig{Enabled: true, Level: "verbose", Path: ""},
+		Devices: []DeviceConfig{{FriendlyName: "X", MaxRetries: 1}},
 	}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "log.level") {
@@ -93,7 +156,7 @@ func TestValidateBadLogLevel(t *testing.T) {
 }
 
 func TestValidateEmptyDevices(t *testing.T) {
-	cfg := &Config{Log: &LogConfig{Enabled: true, Level: "normal"}, Devices: nil, RetryDelay: 1}
+	cfg := &Config{Log: &LogConfig{Enabled: true, Level: "normal"}, Devices: nil}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "empty") {
 		t.Fatalf("expected empty devices error, got %v", err)
@@ -102,9 +165,8 @@ func TestValidateEmptyDevices(t *testing.T) {
 
 func TestValidateEmptyName(t *testing.T) {
 	cfg := &Config{
-		Log:        &LogConfig{Enabled: true, Level: "normal"},
-		Devices:    []DeviceConfig{{FriendlyName: "  ", MaxRetries: 1}},
-		RetryDelay: 1,
+		Log:     &LogConfig{Enabled: true, Level: "normal"},
+		Devices: []DeviceConfig{{FriendlyName: "  ", MaxRetries: 1}},
 	}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "friendly_name") {
@@ -114,9 +176,8 @@ func TestValidateEmptyName(t *testing.T) {
 
 func TestValidateBadRegex(t *testing.T) {
 	cfg := &Config{
-		Log:        &LogConfig{Enabled: true, Level: "normal"},
-		Devices:    []DeviceConfig{{FriendlyName: "regex:[", MaxRetries: 1}},
-		RetryDelay: 1,
+		Log:     &LogConfig{Enabled: true, Level: "normal"},
+		Devices: []DeviceConfig{{FriendlyName: "regex:[", MaxRetries: 1}},
 	}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "invalid regex") {
@@ -126,9 +187,8 @@ func TestValidateBadRegex(t *testing.T) {
 
 func TestValidateEmptyRegex(t *testing.T) {
 	cfg := &Config{
-		Log:        &LogConfig{Enabled: true, Level: "normal"},
-		Devices:    []DeviceConfig{{FriendlyName: "regex:", MaxRetries: 1}},
-		RetryDelay: 1,
+		Log:     &LogConfig{Enabled: true, Level: "normal"},
+		Devices: []DeviceConfig{{FriendlyName: "regex:", MaxRetries: 1}},
 	}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "empty regex") {
@@ -138,9 +198,8 @@ func TestValidateEmptyRegex(t *testing.T) {
 
 func TestValidateMaxRetries(t *testing.T) {
 	cfg := &Config{
-		Log:        &LogConfig{Enabled: true, Level: "normal"},
-		Devices:    []DeviceConfig{{FriendlyName: "X", MaxRetries: 0}},
-		RetryDelay: 1,
+		Log:     &LogConfig{Enabled: true, Level: "normal"},
+		Devices: []DeviceConfig{{FriendlyName: "X", MaxRetries: 0}},
 	}
 	err := cfg.Validate()
 	if err == nil || !strings.Contains(err.Error(), "max_retries") {
@@ -148,27 +207,57 @@ func TestValidateMaxRetries(t *testing.T) {
 	}
 }
 
-func TestValidateRetryDelay(t *testing.T) {
+func TestValidateNegativeRecDelay(t *testing.T) {
 	cfg := &Config{
-		Log:        &LogConfig{Enabled: true, Level: "normal"},
-		Devices:    []DeviceConfig{{FriendlyName: "X", MaxRetries: 1}},
-		RetryDelay: -1,
+		Log: &LogConfig{Enabled: true, Level: "normal"},
+		Devices: []DeviceConfig{{
+			FriendlyName: "X",
+			MaxRetries:   1,
+			RecDelay:     RecDelaySpec{Present: true, Based: "uptime", Sec: -5},
+		}},
 	}
 	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "retry_delay") {
-		t.Fatalf("expected retry_delay error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "rec_delay.sec") {
+		t.Fatalf("expected rec_delay.sec error, got %v", err)
 	}
 }
 
-func TestValidateNegativeDelay(t *testing.T) {
+func TestValidateBadRecDelayBased(t *testing.T) {
 	cfg := &Config{
-		Log:        &LogConfig{Enabled: true, Level: "normal"},
-		Devices:    []DeviceConfig{{FriendlyName: "X", MaxRetries: 1, Delay: -5}},
-		RetryDelay: 0,
+		Log: &LogConfig{Enabled: true, Level: "normal"},
+		Devices: []DeviceConfig{{
+			FriendlyName: "X",
+			MaxRetries:   1,
+			RecDelay:     RecDelaySpec{Present: true, Based: "boot", Sec: 1},
+		}},
 	}
 	err := cfg.Validate()
-	if err == nil || !strings.Contains(err.Error(), "delay") {
-		t.Fatalf("expected delay error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "rec_delay.based") {
+		t.Fatalf("expected rec_delay.based error, got %v", err)
+	}
+}
+
+func TestValidateRecDelayObjectMissingField(t *testing.T) {
+	path := writeTempConfig(t, `{
+		`+validLogJSON()+`,
+		"devices": [{"friendly_name": "X", "max_retries": 1, "rec_delay": {"based": "uptime"}}]
+	}`)
+	_, err := LoadConfig(path)
+	if err == nil || !strings.Contains(err.Error(), "rec_delay") {
+		t.Fatalf("expected rec_delay object error, got %v", err)
+	}
+}
+
+func TestValidateNegativeAdvanced(t *testing.T) {
+	neg := -1
+	cfg := &Config{
+		Log:      &LogConfig{Enabled: true, Level: "normal"},
+		Devices:  []DeviceConfig{{FriendlyName: "X", MaxRetries: 1}},
+		Advanced: &AdvancedConfig{RetryInterval: &neg},
+	}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "retry_interval") {
+		t.Fatalf("expected retry_interval error, got %v", err)
 	}
 }
 
@@ -186,5 +275,12 @@ func TestLoadSampleConfig(t *testing.T) {
 	}
 	if cfg.Log == nil {
 		t.Fatal("sample must have log object")
+	}
+	if cfg.Advanced != nil {
+		t.Fatal("sample should omit advanced")
+	}
+	rd := cfg.Devices[0].RecDelay
+	if !rd.Present || rd.Based != "uptime" || rd.Sec != 10 {
+		t.Fatalf("sample rec_delay: %+v", rd)
 	}
 }

@@ -8,17 +8,18 @@ import (
 	"time"
 )
 
-const maxLogBytes = 10 * 1024 * 1024 // 10 MiB — overwrite/truncate when exceeded
+const defaultMaxLogBytes = 10 * 1024 * 1024 // 10 MiB — default overwrite/truncate threshold
 
-// Logger writes UTF-8 log lines with size-based rotation (truncate when > maxLogBytes).
+// Logger writes UTF-8 log lines with size-based rotation (truncate when > maxBytes).
 // When disabled, all methods are no-ops (no file writes and no console output).
 type Logger struct {
-	mu      sync.Mutex
-	file    *os.File
-	path    string
-	size    int64
-	enabled bool
-	debug   bool
+	mu       sync.Mutex
+	file     *os.File
+	path     string
+	size     int64
+	maxBytes int64
+	enabled  bool
+	debug    bool
 }
 
 // NewLogger opens a logger from LogConfig. Relative paths resolve against the exe directory.
@@ -30,7 +31,7 @@ func NewLogger(cfg *LogConfig) (*Logger, error) {
 	level := strings.ToLower(strings.TrimSpace(cfg.Level))
 	debug := level == LogLevelDebug
 	if !cfg.Enabled {
-		return &Logger{enabled: false, debug: debug}, nil
+		return &Logger{enabled: false, debug: debug, maxBytes: defaultMaxLogBytes}, nil
 	}
 	path, err := ResolvePathRelativeToExe(cfg.Path)
 	if err != nil {
@@ -45,7 +46,18 @@ func NewLogger(cfg *LogConfig) (*Logger, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("failed to stat log file %s: %w", path, err)
 	}
-	return &Logger{file: f, path: path, size: info.Size(), enabled: true, debug: debug}, nil
+	return &Logger{file: f, path: path, size: info.Size(), maxBytes: defaultMaxLogBytes, enabled: true, debug: debug}, nil
+}
+
+// SetMaxBytes sets the rotation threshold (from advanced.log_max_bytes).
+// Non-positive values are ignored (keep current / default).
+func (l *Logger) SetMaxBytes(n int64) {
+	if l == nil || n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.maxBytes = n
 }
 
 // NewLoggerAtPath is a test helper: enabled normal-level logger at an absolute path.
@@ -68,9 +80,13 @@ func (l *Logger) Close() error {
 	return err
 }
 
-// rotateIfNeededLocked truncates when current_size + nextBytes would exceed 10 MiB.
+// rotateIfNeededLocked truncates when current_size + nextBytes would exceed maxBytes.
 func (l *Logger) rotateIfNeededLocked(nextBytes int) error {
-	if l.size+int64(nextBytes) <= maxLogBytes {
+	limit := l.maxBytes
+	if limit <= 0 {
+		limit = defaultMaxLogBytes
+	}
+	if l.size+int64(nextBytes) <= limit {
 		return nil
 	}
 	if err := l.file.Close(); err != nil {
@@ -84,7 +100,7 @@ func (l *Logger) rotateIfNeededLocked(nextBytes int) error {
 	l.file = f
 	l.size = 0
 	header := fmt.Sprintf("[%s] === log rotated (exceeded %d bytes) ===\n",
-		time.Now().Format("2006-01-02 15:04:05.000"), maxLogBytes)
+		time.Now().Format("2006-01-02 15:04:05.000"), limit)
 	n, err := l.file.WriteString(header)
 	l.size += int64(n)
 	return err

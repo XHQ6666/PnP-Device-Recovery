@@ -20,11 +20,12 @@ func testLogger(t *testing.T) *Logger {
 }
 
 func testCfg(devices ...DeviceConfig) *Config {
-	return &Config{
-		Log:        &LogConfig{Enabled: true, Level: LogLevelNormal, Path: "x.log"},
-		Devices:    devices,
-		RetryDelay: 0,
+	cfg := &Config{
+		Log:     &LogConfig{Enabled: true, Level: LogLevelNormal, Path: "x.log"},
+		Devices: devices,
 	}
+	cfg.resolved = defaultAdvancedValues()
+	return cfg
 }
 
 func TestDeviceInfoHealthy(t *testing.T) {
@@ -61,6 +62,8 @@ func TestRecoveryCoalesceSameDevice(t *testing.T) {
 		t.Fatal(err)
 	}
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 
 	info := &DeviceInfo{
 		FriendlyName: "TestDev",
@@ -87,6 +90,8 @@ func TestRecoveryStopPreventsNew(t *testing.T) {
 	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 2})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 	rm.StopNewWork()
 
 	info := &DeviceInfo{
@@ -126,6 +131,8 @@ func TestFindMatcher(t *testing.T) {
 	)
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 	m, d := rm.FindMatcher("Exact Name")
 	if m == nil || d.MaxRetries != 1 {
 		t.Fatal("exact")
@@ -148,6 +155,8 @@ func TestConcurrentDifferentDevices(t *testing.T) {
 	)
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
@@ -278,6 +287,8 @@ func TestExhaustedThenCheckClears(t *testing.T) {
 	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 2})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 
 	stub := newStatefulStub("TestDev", "PCI\\VEN_10DE\\1")
 	var disables, enables int32
@@ -313,6 +324,8 @@ func TestInstanceIDFoldSameSession(t *testing.T) {
 	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 5})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 
 	block := make(chan struct{})
 	var disables int32
@@ -349,6 +362,8 @@ func TestStateMachineIdleRecoveringExhausted(t *testing.T) {
 	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 1})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 
 	stub := newStatefulStub("TestDev", "USB\\VID_0001\\1")
 	entered := make(chan struct{}, 1)
@@ -398,6 +413,8 @@ func TestSuccessResetsToIdle(t *testing.T) {
 	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 3})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 
 	stub := newStatefulStub("TestDev", "ID1")
 	atomic.StoreInt32(&stub.step, 1) // enable will heal
@@ -416,12 +433,18 @@ func TestSuccessResetsToIdle(t *testing.T) {
 	}
 }
 
-func TestDelaySkipsAutoButCheckIgnores(t *testing.T) {
+func TestRecDelayDaemonSkipsAutoButCheckIgnores(t *testing.T) {
 	lg := testLogger(t)
-	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 2, Delay: 3600})
+	cfg := testCfg(DeviceConfig{
+		FriendlyName: "TestDev",
+		MaxRetries:   2,
+		RecDelay:     RecDelaySpec{Present: true, Based: "daemon", Sec: 3600},
+	})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
-	rm.setProcessStartForTest(time.Now()) // delay not elapsed
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
+	rm.setProcessStartForTest(time.Now()) // daemon delay not elapsed
 
 	stub := newStatefulStub("TestDev", "IDDELAY")
 	var disables int32
@@ -431,13 +454,135 @@ func TestDelaySkipsAutoButCheckIgnores(t *testing.T) {
 	rm.Scan(ctx, ScanReason{Reason: "startup"})
 	rm.Wait()
 	if n := atomic.LoadInt32(&disables); n != 0 {
-		t.Fatalf("auto recover must skip during delay, disables=%d", n)
+		t.Fatalf("auto recover must skip during rec_delay, disables=%d", n)
 	}
 
 	rm.Scan(ctx, ScanReason{Reason: "check", IgnoreDelay: true})
 	rm.Wait()
 	if n := atomic.LoadInt32(&disables); n == 0 {
-		t.Fatal("check must ignore delay and recover")
+		t.Fatal("check must ignore rec_delay and recover")
+	}
+}
+
+func TestRecDelayUptimeGateAndBypass(t *testing.T) {
+	lg := testLogger(t)
+	bypass := 60
+	cfg := testCfg(DeviceConfig{
+		FriendlyName: "TestDev",
+		MaxRetries:   1,
+		RecDelay:     RecDelaySpec{Present: true, Based: "uptime", Sec: 3600},
+	})
+	cfg.Advanced = &AdvancedConfig{UptimeBypass: &bypass}
+	cfg.resolved = cfg.resolveAdvanced()
+
+	ms, _ := BuildMatchers(cfg.Devices)
+	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
+
+	stub := newStatefulStub("TestDev", "IDUP")
+	var disables int32
+	rm.setOps(stub.ops(&disables, nil))
+
+	// Uptime below sec and below bypass → skip
+	rm.setUptimeFnForTest(func() (time.Duration, bool) { return 10 * time.Second, true })
+	ctx := context.Background()
+	rm.HandleDeviceProblem(ctx, stubUnhealthy("TestDev", "IDUP"), false)
+	rm.Wait()
+	if n := atomic.LoadInt32(&disables); n != 0 {
+		t.Fatalf("uptime < sec and < bypass must skip, disables=%d", n)
+	}
+
+	// Uptime >= bypass → allow even if sec not met
+	rm.setUptimeFnForTest(func() (time.Duration, bool) { return 60 * time.Second, true })
+	rm.HandleDeviceProblem(ctx, stubUnhealthy("TestDev", "IDUP"), false)
+	rm.Wait()
+	if n := atomic.LoadInt32(&disables); n == 0 {
+		t.Fatal("uptime_bypass should allow Recover")
+	}
+}
+
+func TestRecDelayUptimeBypassOff(t *testing.T) {
+	lg := testLogger(t)
+	zero := 0
+	cfg := testCfg(DeviceConfig{
+		FriendlyName: "TestDev",
+		MaxRetries:   1,
+		RecDelay:     RecDelaySpec{Present: true, Based: "uptime", Sec: 100},
+	})
+	cfg.Advanced = &AdvancedConfig{UptimeBypass: &zero}
+	cfg.resolved = cfg.resolveAdvanced()
+	ms, _ := BuildMatchers(cfg.Devices)
+	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
+	rm.setUptimeFnForTest(func() (time.Duration, bool) { return 60 * time.Second, true }) // >= old default bypass but bypass off
+
+	stub := newStatefulStub("TestDev", "IDBYP")
+	var disables int32
+	rm.setOps(stub.ops(&disables, nil))
+	rm.HandleDeviceProblem(context.Background(), stubUnhealthy("TestDev", "IDBYP"), false)
+	rm.Wait()
+	if n := atomic.LoadInt32(&disables); n != 0 {
+		t.Fatalf("uptime_bypass=0 must wait for sec, disables=%d", n)
+	}
+}
+
+func TestRecDelayDeviceBased(t *testing.T) {
+	lg := testLogger(t)
+	cfg := testCfg(DeviceConfig{
+		FriendlyName: "TestDev",
+		MaxRetries:   1,
+		RecDelay:     RecDelaySpec{Present: true, Based: "device", Sec: 3600},
+	})
+	ms, _ := BuildMatchers(cfg.Devices)
+	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
+
+	stub := newStatefulStub("TestDev", "IDDEV")
+	var disables int32
+	rm.setOps(stub.ops(&disables, nil))
+
+	ctx := context.Background()
+	rm.HandleDeviceProblem(ctx, stubUnhealthy("TestDev", "IDDEV"), false)
+	rm.Wait()
+	if n := atomic.LoadInt32(&disables); n != 0 {
+		t.Fatalf("device rec_delay just set must skip, disables=%d", n)
+	}
+
+	// Seed firstSeen in the past → allow
+	key := NormalizeInstanceID("IDDEV")
+	rm.setFirstSeenForTest(key, time.Now().Add(-2*time.Hour))
+	rm.HandleDeviceProblem(ctx, stubUnhealthy("TestDev", "IDDEV"), false)
+	rm.Wait()
+	if n := atomic.LoadInt32(&disables); n == 0 {
+		t.Fatal("device rec_delay elapsed should recover")
+	}
+}
+
+func TestRetryIntervalBetweenAttempts(t *testing.T) {
+	lg := testLogger(t)
+	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 2})
+	cfg.resolved.RetryInterval = 0 // still zero; we measure gap sleeps via stub timing with nonzero interval
+	ms, _ := BuildMatchers(cfg.Devices)
+	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 30 * time.Millisecond
+
+	stub := newStatefulStub("TestDev", "IDRI")
+	var disables int32
+	rm.setOps(stub.ops(&disables, nil))
+
+	start := time.Now()
+	rm.HandleDeviceProblem(context.Background(), stubUnhealthy("TestDev", "IDRI"), true)
+	rm.Wait()
+	elapsed := time.Since(start)
+	if atomic.LoadInt32(&disables) != 2 {
+		t.Fatalf("expected 2 attempts, disables=%d", disables)
+	}
+	if elapsed < 25*time.Millisecond {
+		t.Fatalf("expected retry_interval sleep between attempts, elapsed=%s", elapsed)
 	}
 }
 
@@ -446,6 +591,8 @@ func TestProblemCodeFilterSkips(t *testing.T) {
 	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 2, ProblemCode: ProblemCodeSet{43}})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 
 	stub := newStatefulStub("TestDev", "IDPC")
 	stub.dev.ProblemCode = 10 // not in set
@@ -474,6 +621,8 @@ func TestSkipDisableWhenAlreadyDisabled(t *testing.T) {
 	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 1})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 
 	stub := newStatefulStub("TestDev", "IDDIS")
 	stub.dev.ProblemCode = CM_PROB_DISABLED
@@ -503,6 +652,8 @@ func TestSkipEnableWhenAlreadyEnabled(t *testing.T) {
 	cfg := testCfg(DeviceConfig{FriendlyName: "TestDev", MaxRetries: 1})
 	ms, _ := BuildMatchers(cfg.Devices)
 	rm := NewRecoveryManager(cfg, ms, lg)
+	rm.setGapForTest(0)
+	rm.retryInterval = 0
 
 	var disables, enables int32
 	dev := stubUnhealthy("TestDev", "IDEN")

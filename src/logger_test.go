@@ -22,7 +22,7 @@ func TestLoggerWriteAndRotate(t *testing.T) {
 
 	// Force rotation by setting size past limit
 	lg.mu.Lock()
-	lg.size = maxLogBytes
+	lg.size = defaultMaxLogBytes
 	lg.mu.Unlock()
 	lg.Log("after rotate")
 
@@ -105,7 +105,7 @@ func TestLoggerSizeBeforeWrite(t *testing.T) {
 	}
 	// current_size + len(line) > 10MiB even if current_size itself is still below the cap
 	lg.mu.Lock()
-	lg.size = maxLogBytes - 10
+	lg.size = defaultMaxLogBytes - 10
 	lg.mu.Unlock()
 	lg.Log("this line is longer than ten bytes so it must rotate first")
 	if err := lg.Close(); err != nil {

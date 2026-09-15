@@ -13,15 +13,15 @@ const (
 	PhaseNormalRunning      = "NORMAL_RUNNING"
 )
 
-// Trailing-edge debounce interval (internal, not config.json).
-const debounceInterval = 500 * time.Millisecond
+// Default trailing-edge debounce when advanced.pnp_debounce_ms is omitted.
+const defaultDebounceInterval = 500 * time.Millisecond
 
 // ScanReason describes why a configured-device scan was started.
 type ScanReason struct {
 	Reason          string
 	TriggerInstance string
 	TriggerAction   string
-	IgnoreDelay     bool // true for IPC/CLI check — recover immediately despite devices[].delay
+	IgnoreDelay     bool // true for IPC/CLI check — recover immediately despite devices[].rec_delay
 }
 
 // eventCoalescer is a trailing-edge debounce: each Trigger resets the timer;
@@ -102,7 +102,14 @@ func NewDaemon(cfg *Config, matchers []*Matcher, logger *Logger) *Daemon {
 		ctx:      ctx,
 		cancel:   cancel,
 	}
-	d.coalescer = newEventCoalescer(debounceInterval, d.onDebounced)
+	debounce := defaultDebounceInterval
+	if cfg != nil {
+		ms := cfg.AdvancedResolved().PnpDebounceMs
+		if ms >= 0 {
+			debounce = time.Duration(ms) * time.Millisecond
+		}
+	}
+	d.coalescer = newEventCoalescer(debounce, d.onDebounced)
 	return d
 }
 
